@@ -1,6 +1,6 @@
 # 项目文档：基于Crazyflie开发平台的微型无人机编队控制研究
 
-> **最后更新**: 2025年7月 → 2026年3月05日  
+> **最后更新**: 2025年7月 → 2026年3月05日 → 3月06日  
 > **目的**: 记录项目所有已实现功能、开发环境、代码架构和开发进程，避免每次重新阅读全部代码
 
 ---
@@ -159,6 +159,38 @@ $$
 
 其中 $w$ 为边权重向量，$\Omega$ 由 $w$ 通过邻接关系构造。
 
+### 4.6 CBF 碰撞避免安全滤波
+
+基于控制障碍函数 (Control Barrier Functions, CBF) 的碰撞避免安全滤波器 (Ames et al., ECC 2019; Wang et al., IEEE T-RO 2017)。
+
+**障碍函数**：对每对智能体 $(i,j)$，定义
+
+$$h_{ij}(p) = \|p_i - p_j\|^2 - d_s^2$$
+
+$h_{ij} > 0$ 表示安全，$h_{ij} = 0$ 为安全边界。
+
+**CBF 条件**（一阶积分器 $\dot{p} = u$）：
+
+$$\dot{h}_{ij} = 2(p_i - p_j)^T(u_i - u_j) \geq -\gamma h_{ij}$$
+
+其中 $\gamma > 0$ 为 class-$\mathcal{K}$ 函数衰减率。
+
+**安全滤波 QP**：
+
+$$\min_{u_f} \|u_f - u_f^{\text{nom}}\|^2 \quad \text{s.t.}$$
+- 跟随者-跟随者: $2(p_i - p_j)^T(u_i - u_j) \geq -\gamma h_{ij}$
+- 跟随者-领导者: $2(p_i - p_l)^T u_i \geq -\gamma h_{il} + 2(p_i - p_l)^T v_l$
+
+**关键性质**：
+1. **前向不变性**: 若 $h_{ij}(0) > 0$，则 $h_{ij}(t) \geq 0, \forall t \geq 0$
+2. **最小侵入**: QP 保证安全控制最接近标称 AFC 控制
+3. **与饱和兼容**: 先施加饱和再施加 CBF 滤波
+
+**Crazyflie 2.1 安全参数**：
+- 安全距离 $d_s = 0.2$ m（考虑机架 92mm + 桨叶气流 + 定位误差）
+- 激活距离 $d_a = 0.6$ m（仅近邻对触发 QP 约束）
+- CBF 衰减率 $\gamma = 3.0$
+
 ### 4.4 稀疏通信图设计（4 阶段算法）
 
 为适应 Crazyflie P2P 通信约束（最大邻居数=6，通信距离=10m），实现稀疏图设计：
@@ -287,8 +319,9 @@ create_leader_trajectory(phases) → callable(t) → positions
 
 | 函数 | 功能 |
 |------|------|
-| `simulate_first_order(controller, leader_traj, init_pos, T, dt)` | 一阶积分器仿真，返回 (t, pos_history, errors, control_inputs) |
-| `simulate_second_order(controller, leader_traj, init_pos, T, dt)` | 二阶积分器仿真，返回 (t, pos_history, errors, control_inputs) |
+| `simulate_first_order(controller, leader_traj, init_pos, T, dt)` | 一阶积分器仿真 (RK45)，返回 (t, pos_history, errors, control_inputs) |
+| `simulate_second_order(controller, leader_traj, init_pos, T, dt)` | 二阶积分器仿真 (RK45)，返回 (t, pos_history, errors, control_inputs) |
+| `simulate_first_order_cbf(controller, init_pos, leader_traj, T, dt, cbf_filter)` | 一阶积分器 + CBF 碰撞避免 (前向 Euler)，返回 (t, pos, err, ctrl, cbf_data) |
 
 #### 可视化函数
 
@@ -302,6 +335,37 @@ create_leader_trajectory(phases) → callable(t) → positions
 | (main 内指标对比) | fig6_sparse_comparison.png | 边数/度数/λ_min 柱状图 |
 | (main 内饱和分析) | fig7_saturation_analysis.png | 控制输入范数 + 误差对比 + 饱和比例 |
 | (main 内饱和对比) | fig8_saturation_comparison.png | 不同 u_max 下误差 + 控制量对比 |
+| (main 内CBF对比) | fig9_cbf_collision_avoidance.png | 最小距离 + 误差收敛 (有/无CBF) |
+| (main 内CBF分析) | fig10_cbf_analysis.png | 约束激活数 + 修正幅度 + 控制量 + 成对距离 |
+
+### 5.6 `collision_avoidance.py` — CBF 碰撞避免
+
+```python
+CRAZYFLIE_SAFETY = {
+    'safety_distance_m': 0.2,    # 安全距离 d_s (m)
+    'activate_distance_m': 0.6,  # CBF 激活距离 (m)
+    'cbf_gamma': 3.0,            # 默认衰减率
+    ...
+}
+
+class CBFSafetyFilter:
+    def __init__(self, n_agents, leader_indices, d_safe=0.2, gamma=3.0, d_activate=None)
+```
+
+| 方法 | 功能 |
+|------|------|
+| `barrier(pi, pj)` | 计算障碍函数 $h_{ij} = \|p_i-p_j\|^2 - d_s^2$ |
+| `filter(positions, u_nom, leader_velocities)` | CBF-QP 安全滤波，返回 (u_safe, info) |
+| `_solve_qp(u_nom_flat, C, b)` | scipy SLSQP 求解 min‖u-u_nom‖² s.t. Cu≥b |
+| `min_distance(positions)` | 所有智能体最小距离 (静态方法) |
+| `all_min_distances_over_time(pos_history)` | 沿时间轴最小距离 (静态方法) |
+| `pairwise_distance_matrix(positions)` | 全成对距离矩阵 (静态方法) |
+
+#### CBF-QP 工作流程
+1. 遍历所有智能体对，检查距离是否 < d_activate
+2. 对近邻对构建线性约束 Cu ≥ b
+3. 无约束时直接返回 u_nom（零开销）
+4. 有约束时求解 QP，返回最接近 u_nom 的安全控制
 
 ### 5.5 `animate_sim.py` — 3D 动画
 
@@ -341,6 +405,19 @@ create_leader_trajectory(phases) → callable(t) → positions
 | 收敛速率 | 0.119 |
 | 时间常数 τ | 8.42 s |
 | 仿射不变性误差 | 1.56e-14 ✓ |
+
+### 6.4 CBF 碰撞避免结果
+
+碰撞风险场景：初始扰动 σ=1.5m（正常场景 3 倍），安全距离 d_s=0.2m
+
+| 指标 | 无 CBF | 有 CBF |
+|------|--------|--------|
+| 最小智能体间距 | 0.1072 m ⚠ **碰撞!** | 0.2250 m ✓ |
+| 最终编队误差 | 0.5701 | 0.5707 |
+| CBF 约束激活率 | — | 24.0% (408/1701步) |
+| 最大修正幅度 | — | 0.4225 m/s |
+
+结论：CBF 安全滤波器以极小的编队误差代价（<0.1%）保证了碰撞安全。
 
 ### 6.3 输入饱和约束结果 (u_max = 1.0 m/s, smooth tanh)
 
@@ -445,6 +522,21 @@ create_leader_trajectory(phases) → callable(t) → positions
     - fig8: 不同 u_max 下误差收敛 + 最大控制量对比
     - `simulate_first_order` / `simulate_second_order` 现在返回控制输入历史
 
+### 阶段 8：碰撞避免
+
+22. **CBF 碰撞避免模块** (`collision_avoidance.py`):
+    - 基于控制障碍函数 (CBF) + 二次规划 (QP) 的安全滤波器
+    - Crazyflie 安全参数: d_s=0.2m, d_activate=0.6m, γ=3.0
+    - scipy SLSQP 求解 QP，仅在近邻对距离 < d_activate 时触发
+    - 理论依据: Ames et al. (ECC 2019), Wang et al. (IEEE T-RO 2017)
+
+23. **CBF 仿真集成** (`main_sim.py`):
+    - 新增 `simulate_first_order_cbf()` 函数（前向 Euler + CBF 滤波）
+    - Step 7.5: 碰撞风险场景（σ=1.5m）有/无 CBF 对比仿真
+    - fig9: 最小距离 + 误差收敛对比
+    - fig10: CBF 约束激活数 + 修正幅度 + 控制量 + 成对距离
+    - 无 CBF 最小距离 0.107m（碰撞!）→ 有 CBF 0.225m（安全 ✓）
+
 ---
 
 ## 八、已识别的局限性与改进方向
@@ -452,7 +544,7 @@ create_leader_trajectory(phases) → callable(t) → positions
 ### 当前局限性
 
 1. **静态图**: 通信拓扑固定，不支持动态切换/故障恢复
-2. **无碰撞避免**: 仿真未考虑智能体间碰撞
+2. ~~无碰撞避免~~: **已解决** — CBF-QP 安全滤波 (见 4.6)
 3. **简化动力学**: 使用积分器模型，未建模四旋翼实际动力学
 4. **集中式初始化**: 应力矩阵计算需要集中式 SDP，仅控制阶段分布式
 5. **无通信延迟/丢包**: 理想通信假设
@@ -470,6 +562,7 @@ create_leader_trajectory(phases) → callable(t) → positions
 ### 已解决的局限性
 
 - ~~输入无约束~~: 已实现 smooth/norm/clip 三种饱和模式，支持 Crazyflie 速度限制 (u_max=1.0 m/s)
+- ~~无碰撞避免~~: 已实现 CBF-QP 安全滤波器，保证智能体间距 ≥ d_s=0.2m，仅在 24% 时步激活约束
 
 ---
 

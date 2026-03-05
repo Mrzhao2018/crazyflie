@@ -32,6 +32,8 @@ from formation import (
     CRAZYFLIE_COMM,
 )
 from afc_controller import AFCController
+from archive import SimArchive
+from collision_avoidance import CBFSafetyFilter, CRAZYFLIE_SAFETY
 
 # 设置中文字体
 plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei', 'DejaVu Sans']
@@ -175,6 +177,96 @@ def simulate_second_order(controller, initial_positions, initial_velocities,
     return sol.t, positions_history, errors, control_inputs
 
 
+def simulate_first_order_cbf(controller, initial_positions,
+                              leader_traj_func, t_span, dt=0.02,
+                              cbf_filter=None):
+    """
+    一阶积分器仿真（前向 Euler 积分），可选 CBF 碰撞避免。
+
+    使用前向 Euler 而非 RK45，以配合 CBF 的离散时间安全保证。
+    当 cbf_filter=None 时等价于普通 Euler 积分（用于公平对比）。
+
+    Parameters
+    ----------
+    controller : AFCController
+    initial_positions : ndarray (n, d)
+    leader_traj_func : callable
+    t_span : (float, float)
+    dt : float
+    cbf_filter : CBFSafetyFilter or None
+
+    Returns
+    -------
+    times : ndarray (n_steps,)
+    positions_history : ndarray (n_steps, n, d)
+    errors : ndarray (n_steps,)
+    control_inputs : ndarray (n_steps, n_f, d)
+    cbf_data : dict
+        min_distances, modifications, n_active
+    """
+    n = controller.n
+    d = initial_positions.shape[1]
+    f_idx = controller.follower_indices
+    l_idx = controller.leader_indices
+    n_f = controller.n_f
+
+    times = np.arange(t_span[0], t_span[1] + dt / 2, dt)
+    n_steps = len(times)
+
+    positions_history = np.zeros((n_steps, n, d))
+    errors = np.zeros(n_steps)
+    control_inputs = np.zeros((n_steps, n_f, d))
+    min_distances = np.zeros(n_steps)
+    cbf_modifications = np.zeros(n_steps)
+    n_active_constraints = np.zeros(n_steps, dtype=int)
+
+    positions = initial_positions.copy()
+
+    for idx in range(n_steps):
+        t = times[idx]
+        p_l = leader_traj_func(t)
+        positions[l_idx] = p_l
+        positions_history[idx] = positions.copy()
+
+        p_f = positions[f_idx]
+
+        # AFC 标称控制 + 饱和
+        u_nom = -controller.gain * (controller.Omega_ff @ p_f
+                                    + controller.Omega_fl @ p_l)
+        u_nom = controller.saturate(u_nom)
+
+        # CBF 安全滤波
+        if cbf_filter is not None:
+            eps = 1e-4
+            v_l = (leader_traj_func(t + eps) - p_l) / eps
+            u_safe, cbf_info = cbf_filter.filter(positions, u_nom, v_l)
+            cbf_modifications[idx] = cbf_info['modification_norm']
+            n_active_constraints[idx] = cbf_info['n_constraints']
+        else:
+            u_safe = u_nom
+
+        control_inputs[idx] = u_safe
+
+        # 最小距离
+        min_d, _ = CBFSafetyFilter.min_distance(positions)
+        min_distances[idx] = min_d
+
+        # 编队误差
+        p_f_star = controller.steady_state(p_l)
+        errors[idx] = np.linalg.norm(p_f - p_f_star)
+
+        # 前向 Euler 积分
+        if idx < n_steps - 1:
+            positions[f_idx] = p_f + dt * u_safe
+
+    cbf_data = {
+        'min_distances': min_distances,
+        'modifications': cbf_modifications,
+        'n_active': n_active_constraints,
+    }
+    return times, positions_history, errors, control_inputs, cbf_data
+
+
 # ============================================================
 # 可视化工具
 # ============================================================
@@ -283,6 +375,9 @@ def main():
     print(f"  Followers: {follower_indices}")
     print("  完全图基准:")
     graph_info(adj_complete)
+
+    # 初始化存档系统
+    archive = SimArchive(tag='afc')
 
     # ----------------------------------------------------------
     # Step 2: 稀疏应力矩阵设计（Crazyflie P2P 通信约束）
@@ -460,6 +555,7 @@ def main():
     fig1.tight_layout()
     fig1.savefig('e:/crazyflie/src/fig1_formation_snapshots.png',
                  dpi=200, bbox_inches='tight')
+    archive.save_figure(fig1, 'fig1_formation_snapshots')
     print("  已保存: fig1_formation_snapshots.png")
 
     # ==== 图2: 3D 轨迹 ====
@@ -471,6 +567,7 @@ def main():
     fig2.tight_layout()
     fig2.savefig('e:/crazyflie/src/fig2_trajectories_3d.png',
                  dpi=200, bbox_inches='tight')
+    archive.save_figure(fig2, 'fig2_trajectories_3d')
     print("  已保存: fig2_trajectories_3d.png")
 
     # ==== 图3: 误差收敛 ====
@@ -507,6 +604,7 @@ def main():
     fig3.tight_layout()
     fig3.savefig('e:/crazyflie/src/fig3_convergence.png',
                  dpi=200, bbox_inches='tight')
+    archive.save_figure(fig3, 'fig3_convergence')
     print("  已保存: fig3_convergence.png")
 
     # ==== 图4: 应力矩阵热力图 ====
@@ -543,6 +641,7 @@ def main():
     fig4.tight_layout()
     fig4.savefig('e:/crazyflie/src/fig4_stress_matrix.png',
                  dpi=200, bbox_inches='tight')
+    archive.save_figure(fig4, 'fig4_stress_matrix')
     print("  已保存: fig4_stress_matrix.png")
 
     # ==== 图5: 稀疏 vs 完全图拓扑对比 ====
@@ -561,6 +660,7 @@ def main():
     fig5.tight_layout()
     fig5.savefig('e:/crazyflie/src/fig5_communication_graph.png',
                  dpi=200, bbox_inches='tight')
+    archive.save_figure(fig5, 'fig5_communication_graph')
     print("  已保存: fig5_communication_graph.png")
 
     # ==== 图6: Crazyflie 通信指标对比 ====
@@ -626,6 +726,7 @@ def main():
     fig6.tight_layout()
     fig6.savefig('e:/crazyflie/src/fig6_sparse_comparison.png',
                  dpi=200, bbox_inches='tight')
+    archive.save_figure(fig6, 'fig6_sparse_comparison')
     print("  已保存: fig6_sparse_comparison.png")
 
     # ==== 图7: 控制输入与饱和约束分析 ====
@@ -704,6 +805,7 @@ def main():
     fig7.tight_layout()
     fig7.savefig('e:/crazyflie/src/fig7_saturation_analysis.png',
                  dpi=200, bbox_inches='tight')
+    archive.save_figure(fig7, 'fig7_saturation_analysis')
     print("  已保存: fig7_saturation_analysis.png")
 
     # ==== 图8: 不同饱和上限对比 ====
@@ -746,7 +848,188 @@ def main():
     fig8.tight_layout()
     fig8.savefig('e:/crazyflie/src/fig8_saturation_comparison.png',
                  dpi=200, bbox_inches='tight')
+    archive.save_figure(fig8, 'fig8_saturation_comparison')
     print("  已保存: fig8_saturation_comparison.png")
+
+    # ----------------------------------------------------------
+    # Step 7.5: CBF 碰撞避免安全滤波验证
+    # ----------------------------------------------------------
+    print("\n[Step 7.5] CBF 碰撞避免安全滤波验证...")
+
+    d_safe = CRAZYFLIE_SAFETY['safety_distance_m']
+    gamma_cbf = CRAZYFLIE_SAFETY['cbf_gamma']
+    d_activate = CRAZYFLIE_SAFETY['activate_distance_m']
+
+    cbf = CBFSafetyFilter(
+        n_agents=10, leader_indices=leader_indices,
+        d_safe=d_safe, gamma=gamma_cbf, d_activate=d_activate,
+    )
+
+    print(f"  安全距离 d_s = {d_safe} m (Crazyflie 2.1)")
+    print(f"  CBF 衰减率 γ = {gamma_cbf}")
+    print(f"  激活距离 d_a = {d_activate} m")
+
+    # 碰撞风险场景：大初始扰动（模拟密集起飞 / 初始定位误差大）
+    cbf_noise_std = 1.5
+    np.random.seed(99)
+    init_pos_cbf = nominal_pos.copy()
+    init_pos_cbf[follower_indices] += (
+        np.random.randn(len(follower_indices), d) * cbf_noise_std
+    )
+
+    init_min_d, init_min_pair = CBFSafetyFilter.min_distance(init_pos_cbf)
+    print(f"  碰撞风险场景: 初始扰动 σ = {cbf_noise_std} m")
+    print(f"  初始最小距离: {init_min_d:.4f} m "
+          f"(Agent {init_min_pair[0]}-{init_min_pair[1]})")
+
+    # 无 CBF 仿真（Euler 积分，与 CBF 仿真相同方法以公平对比）
+    print("  运行无 CBF 仿真 (Euler)...")
+    (times_nocbf, pos_nocbf, err_nocbf, ctrl_nocbf,
+     cbf_data_nocbf) = simulate_first_order_cbf(
+        controller, init_pos_cbf, leader_traj, (0, T_total), dt=dt,
+        cbf_filter=None,
+    )
+    print(f"    最终误差: {err_nocbf[-1]:.6f}")
+
+    # 有 CBF 仿真
+    print("  运行 CBF 安全滤波仿真...")
+    (times_wcbf, pos_wcbf, err_wcbf, ctrl_wcbf,
+     cbf_data_wcbf) = simulate_first_order_cbf(
+        controller, init_pos_cbf, leader_traj, (0, T_total), dt=dt,
+        cbf_filter=cbf,
+    )
+    print(f"    最终误差: {err_wcbf[-1]:.6f}")
+
+    min_d_nocbf = cbf_data_nocbf['min_distances']
+    min_d_wcbf = cbf_data_wcbf['min_distances']
+
+    print(f"\n  === CBF 碰撞避免效果 ===")
+    print(f"  无 CBF 最小距离: {min_d_nocbf.min():.4f} m "
+          f"({'安全' if min_d_nocbf.min() > d_safe else '⚠ 低于安全阈值!'})")
+    print(f"  有 CBF 最小距离: {min_d_wcbf.min():.4f} m "
+          f"({'安全 ✓' if min_d_wcbf.min() > d_safe - 0.01 else '⚠ 需调参'})")
+    n_cbf_active = int(np.sum(cbf_data_wcbf['n_active'] > 0))
+    print(f"  CBF 约束激活步数: {n_cbf_active}/{len(times_wcbf)} "
+          f"({100 * n_cbf_active / len(times_wcbf):.1f}%)")
+    print(f"  最大修正幅度: {cbf_data_wcbf['modifications'].max():.4f} m/s")
+
+    # ==== 图9: 最小智能体间距离对比 ====
+    fig9, axes9 = plt.subplots(2, 1, figsize=(14, 8))
+
+    # (a) 最小距离时间历程
+    axes9[0].plot(times_nocbf, min_d_nocbf, 'b-', linewidth=1.2,
+                  alpha=0.8, label='无 CBF')
+    axes9[0].plot(times_wcbf, min_d_wcbf, 'r-', linewidth=1.5,
+                  label='有 CBF 安全滤波')
+    axes9[0].axhline(y=d_safe, color='darkred', linestyle='--', linewidth=2,
+                     label=f'安全距离 d_s = {d_safe} m')
+    axes9[0].fill_between(times_nocbf, 0, d_safe, alpha=0.08, color='red')
+    # 标记违反区域
+    violation_mask = min_d_nocbf < d_safe
+    if np.any(violation_mask):
+        axes9[0].fill_between(times_nocbf, min_d_nocbf, d_safe,
+                              where=violation_mask, alpha=0.3, color='red',
+                              label='安全违反区域')
+    axes9[0].set_xlabel('时间 (s)')
+    axes9[0].set_ylabel('最小智能体间距离 (m)')
+    axes9[0].set_title('(a) 最小智能体间距离对比', fontsize=11)
+    axes9[0].legend(loc='lower right')
+    axes9[0].grid(True, alpha=0.3)
+    axes9[0].set_xlim([0, T_total])
+    axes9[0].set_ylim(bottom=0)
+
+    # (b) 编队误差对比
+    axes9[1].semilogy(times_nocbf, err_nocbf + 1e-16, 'b-', linewidth=1.2,
+                      alpha=0.8, label='无 CBF')
+    axes9[1].semilogy(times_wcbf, err_wcbf + 1e-16, 'r-', linewidth=1.5,
+                      label='有 CBF 安全滤波')
+    axes9[1].set_xlabel('时间 (s)')
+    axes9[1].set_ylabel('编队误差 ||p_f - p_f*||')
+    axes9[1].set_title('(b) 编队误差收敛对比 (碰撞风险场景)', fontsize=11)
+    axes9[1].legend()
+    axes9[1].grid(True, alpha=0.3)
+    axes9[1].set_xlim([0, T_total])
+    for i in range(len(phase_labels)):
+        if i < len(phase_times) - 1:
+            axes9[1].axvspan(phase_times[i], phase_times[i + 1],
+                             alpha=0.1, color=colors[i % len(colors)])
+
+    fig9.suptitle(f'CBF 碰撞避免效果验证 (d_s={d_safe}m, γ={gamma_cbf}, '
+                  f'初始扰动σ={cbf_noise_std}m)', fontsize=13)
+    fig9.tight_layout()
+    fig9.savefig('e:/crazyflie/src/fig9_cbf_collision_avoidance.png',
+                 dpi=200, bbox_inches='tight')
+    archive.save_figure(fig9, 'fig9_cbf_collision_avoidance')
+    print("  已保存: fig9_cbf_collision_avoidance.png")
+
+    # ==== 图10: CBF 安全滤波分析面板 ====
+    fig10, axes10 = plt.subplots(2, 2, figsize=(16, 10))
+
+    # (a) CBF 约束激活数量
+    axes10[0, 0].fill_between(times_wcbf, cbf_data_wcbf['n_active'],
+                               alpha=0.4, color='coral')
+    axes10[0, 0].plot(times_wcbf, cbf_data_wcbf['n_active'],
+                       'r-', linewidth=0.8)
+    axes10[0, 0].set_xlabel('时间 (s)')
+    axes10[0, 0].set_ylabel('活跃约束数')
+    axes10[0, 0].set_title('(a) CBF 约束激活数量', fontsize=11)
+    axes10[0, 0].grid(True, alpha=0.3)
+    axes10[0, 0].set_xlim([0, T_total])
+
+    # (b) 控制修正幅度
+    axes10[0, 1].plot(times_wcbf, cbf_data_wcbf['modifications'],
+                       'r-', linewidth=0.8)
+    axes10[0, 1].fill_between(times_wcbf, cbf_data_wcbf['modifications'],
+                               alpha=0.3, color='coral')
+    axes10[0, 1].set_xlabel('时间 (s)')
+    axes10[0, 1].set_ylabel('||u_safe - u_nom|| (m/s)')
+    axes10[0, 1].set_title('(b) CBF 安全滤波修正幅度', fontsize=11)
+    axes10[0, 1].grid(True, alpha=0.3)
+    axes10[0, 1].set_xlim([0, T_total])
+
+    # (c) 控制输入范数对比
+    ctrl_norms_nocbf = np.linalg.norm(ctrl_nocbf, axis=2).max(axis=1)
+    ctrl_norms_wcbf = np.linalg.norm(ctrl_wcbf, axis=2).max(axis=1)
+    axes10[1, 0].plot(times_nocbf, ctrl_norms_nocbf, 'b-', linewidth=1.0,
+                       alpha=0.7, label='无 CBF')
+    axes10[1, 0].plot(times_wcbf, ctrl_norms_wcbf, 'r-', linewidth=1.0,
+                       alpha=0.7, label='有 CBF')
+    axes10[1, 0].axhline(y=u_max, color='gray', linestyle='--',
+                          linewidth=1.5, alpha=0.5, label=f'u_max={u_max}')
+    axes10[1, 0].set_xlabel('时间 (s)')
+    axes10[1, 0].set_ylabel('max ||u_i|| (m/s)')
+    axes10[1, 0].set_title('(c) 最大控制输入对比', fontsize=11)
+    axes10[1, 0].legend(fontsize=9)
+    axes10[1, 0].grid(True, alpha=0.3)
+    axes10[1, 0].set_xlim([0, T_total])
+
+    # (d) 所有成对跟随者距离（有 CBF）
+    n_pairs = 0
+    for i_loc in range(len(follower_indices)):
+        fi = follower_indices[i_loc]
+        for j_loc in range(i_loc + 1, len(follower_indices)):
+            fj = follower_indices[j_loc]
+            dists = np.linalg.norm(
+                pos_wcbf[:, fi] - pos_wcbf[:, fj], axis=1)
+            axes10[1, 1].plot(times_wcbf, dists, linewidth=0.6, alpha=0.5)
+            n_pairs += 1
+    axes10[1, 1].axhline(y=d_safe, color='darkred', linestyle='--',
+                          linewidth=2, label=f'd_s = {d_safe} m')
+    axes10[1, 1].set_xlabel('时间 (s)')
+    axes10[1, 1].set_ylabel('成对距离 (m)')
+    axes10[1, 1].set_title(f'(d) 跟随者成对距离 ({n_pairs} 对, 有CBF)',
+                            fontsize=11)
+    axes10[1, 1].legend(loc='lower right')
+    axes10[1, 1].grid(True, alpha=0.3)
+    axes10[1, 1].set_xlim([0, T_total])
+    axes10[1, 1].set_ylim(bottom=0)
+
+    fig10.suptitle('CBF 安全滤波器分析', fontsize=14)
+    fig10.tight_layout()
+    fig10.savefig('e:/crazyflie/src/fig10_cbf_analysis.png',
+                  dpi=200, bbox_inches='tight')
+    archive.save_figure(fig10, 'fig10_cbf_analysis')
+    print("  已保存: fig10_cbf_analysis.png")
 
     # ----------------------------------------------------------
     # Step 8: 验证仿射不变性
@@ -792,6 +1075,91 @@ def main():
     print(f"  {np.array2string(eigvals, precision=6)}")
 
     plt.show()
+
+    # ----------------------------------------------------------
+    # Step 9: 存档
+    # ----------------------------------------------------------
+    print("\n[Step 9] 打包存档...")
+
+    # 保存所有数值数据
+    archive.save_arrays(
+        times=times,
+        positions=pos_hist,
+        errors=errors,
+        control_inputs=ctrl_inputs,
+        positions_nosat=pos_hist_ns,
+        errors_nosat=errors_ns,
+        control_inputs_nosat=ctrl_inputs_ns,
+        nominal_positions=nominal_pos,
+        initial_positions=init_pos,
+        cbf_min_distances_nocbf=min_d_nocbf,
+        cbf_min_distances_wcbf=min_d_wcbf,
+        cbf_modifications=cbf_data_wcbf['modifications'],
+        cbf_n_active=cbf_data_wcbf['n_active'],
+    )
+
+    # 保存应力矩阵与邻接矩阵
+    archive.save_matrix_csv('stress_matrix', Omega,
+                            header=','.join(f'agent_{i}' for i in range(10)))
+    archive.save_matrix_csv('adj_sparse', adj)
+    archive.save_matrix_csv('adj_complete', adj_complete)
+
+    # 保存仿真参数
+    archive.save_params({
+        'formation': {
+            'type': 'double_pentagon',
+            'n_agents': 10,
+            'radius': 1.0,
+            'height': 1.0,
+            'leader_indices': leader_indices,
+            'follower_indices': follower_indices,
+        },
+        'controller': {
+            'gain': gain,
+            'u_max': u_max,
+            'saturation_type': 'smooth',
+            'damping': controller.damping,
+        },
+        'simulation': {
+            'dt': dt,
+            'T_total': T_total,
+            't_settle': t_settle,
+            't_trans': t_trans,
+            't_hold': t_hold,
+            'random_seed': 42,
+            'init_noise_std': 0.5,
+        },
+        'sparse_design': info,
+        'convergence': {
+            'rate': rate,
+            'time_constant': tau,
+        },
+        'results': {
+            'initial_error': float(errors[0]),
+            'final_error_sat': float(errors[-1]),
+            'final_error_nosat': float(errors_ns[-1]),
+            'max_ctrl_sat': float(ctrl_norms.max()),
+            'max_ctrl_nosat': float(ctrl_norms_ns.max()),
+            'affine_error': float(affine_error),
+        },
+        'cbf_collision_avoidance': {
+            'd_safe': d_safe,
+            'gamma': gamma_cbf,
+            'd_activate': d_activate,
+            'cbf_noise_std': cbf_noise_std,
+            'min_dist_nocbf': float(min_d_nocbf.min()),
+            'min_dist_wcbf': float(min_d_wcbf.min()),
+            'cbf_active_steps': int(n_cbf_active),
+            'max_modification': float(cbf_data_wcbf['modifications'].max()),
+            'final_error_nocbf': float(err_nocbf[-1]),
+            'final_error_wcbf': float(err_wcbf[-1]),
+        },
+        'stress_matrix_validation': results,
+        'eigenvalues_omega': eigvals.tolist(),
+    })
+
+    archive.finalize()
+
     print("\n仿真完成！")
 
 
