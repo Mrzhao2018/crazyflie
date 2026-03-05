@@ -1,4 +1,25 @@
-/.venv
-/docs
-/qpSWIFT-main.zip
-/webots_2023a_amd64.deb
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# 生成的图表和动画（可通过 main_sim.py 重新生成）
+src/*.png
+src/*.gif
+src/*.mp4
+
+# 仿真存档数据
+saves/
+
+# 配置文件
+settings.yaml
+
+# 文档与安装包
+docs/
+qpSWIFT-main.zip
+webots_2023a_amd64.deb
+
+# IDE
+.vscode/
+.idea/
