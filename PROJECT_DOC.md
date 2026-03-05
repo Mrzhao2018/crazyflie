@@ -1,6 +1,6 @@
 # 项目文档：基于Crazyflie开发平台的微型无人机编队控制研究
 
-> **最后更新**: 2025年7月 → 2026年3月05日 → 3月06日 (新增 ESO 鲁棒抗扰)  
+> **最后更新**: 2025年7月 → 2026年3月05日 → 3月06日 (新增 ESO / 事件触发通信 / 随机测试模块)  
 > **目的**: 记录项目所有已实现功能、开发环境、代码架构和开发进程，避免每次重新阅读全部代码
 
 ---
@@ -79,8 +79,10 @@ e:\crazyflie\
     ├── stress_matrix.py        # 应力矩阵计算（~570行）
     ├── afc_controller.py       # AFC 控制器 + 输入饱和（~260行）
     ├── formation.py            # 编队定义与仿射工具（~460行）
-    ├── main_sim.py             # 仿真主程序（~1490行）
+    ├── main_sim.py             # 仿真主程序（~1870行）
+    ├── event_trigger.py        # 自适应事件触发通信管理器（~170行）
     ├── disturbance_observer.py # ESO 扰动观测器 + 风场模型（~170行）
+    ├── random_test.py          # 随机初始状态 + 复杂仿射变换独立测试（~500行）
     ├── animate_sim.py          # 3D 动画生成（~270行）
     ├── fig1_formation_snapshots.png  # 编队快照
     ├── fig2_trajectories_3d.png     # 3D 轨迹
@@ -94,6 +96,11 @@ e:\crazyflie\
     ├── fig10_cbf_analysis.png           # CBF 分析面板
     ├── fig11_eso_disturbance_rejection.png # ESO 扰动估计与补偿
     ├── fig12_eso_bandwidth_comparison.png  # ESO 带宽对比
+    ├── fig13_et_error_comparison.png        # ET vs 连续通信误差对比
+    ├── fig14_et_communication_analysis.png  # ET 通信分析四面板
+    ├── fig15_et_parameter_comparison.png    # ET 参数扫描
+    ├── fig_rt_single.png                    # 随机测试单次结果
+    ├── fig_rt_monte_carlo.png               # Monte Carlo 统计结果
     ├── afc_animation.gif            # 动画 GIF
     └── afc_animation.mp4            # 动画 MP4
 ```
@@ -231,6 +238,33 @@ $$\delta_f = \Omega_{ff}^{-1} w / K_p$$
 
 由于 $\lambda_{\min}(\Omega_{ff}) = 0.024$ 较小，$\|\delta_f\| \propto 1/\lambda_{\min}$ 很大，系统对扰动敏感。
 
+### 4.8 自适应事件触发通信（二阶积分器）
+
+基于自适应阈值的事件触发通信机制，大幅减少智能体间的通信次数 (Liu et al., arXiv:2506.16797, 2025; Yi et al., Automatica 2016)。
+
+**二阶积分器动力学**:
+
+$$\ddot{p}_i = u_i, \quad u_i = -K_p \sum_{j \in \mathcal{N}_i} \omega_{ij}(\hat{p}_i - \hat{p}_j) - K_d \dot{p}_i$$
+
+其中 $\hat{p}_j$ 为邻居 $j$ 最近一次广播的位置，$\dot{p}_i$ 为本地实时速度。
+
+**事件触发条件**: 智能体 $i$ 在满足以下条件时广播自身位置：
+
+$$\|e_i\|^2 > \frac{1}{\varphi_i} \|\hat{\xi}_i\|^2 + \mu e^{-\varpi t}$$
+
+其中：
+- $e_i = p_i - \hat{p}_i$: 实际位置与最近广播位置的偏差
+- $\hat{\xi}_i = \sum_j \omega_{ij}(\hat{p}_i - \hat{p}_j)$: 使用广播数据计算的编队误差
+- $\varphi_i(t)$: 自适应阈值参数，$\dot{\varphi}_i = \|e_i\|^2$（单调递增）
+- $\mu e^{-\varpi t}$: 指数衰减项，保证 Zeno-free（$\mu=0.01, \varpi=0.5$）
+
+**关键性质**:
+1. **Zeno-free**: 由指数衰减项 $\mu e^{-\varpi t} > 0$ 保证最小触发间隔
+2. **自适应阈值**: $\varphi_i$ 单调递增，随时间推移阈值逐渐放宽，通信率进一步降低
+3. **渐近收敛**: 编队误差在事件触发下仍收敛至有界邻域
+
+**参数选取**: $\mu = 0.01, \varpi = 0.5, \varphi_0 = 1.0, K_p = 5.0, K_d = 2.0$
+
 ### 4.4 稀疏通信图设计（4 阶段算法）
 
 为适应 Crazyflie P2P 通信约束（最大邻居数=6，通信距离=10m），实现稀疏图设计：
@@ -362,6 +396,7 @@ create_leader_trajectory(phases) → callable(t) → positions
 | `simulate_first_order(controller, leader_traj, init_pos, T, dt)` | 一阶积分器仿真 (RK45)，返回 (t, pos_history, errors, control_inputs) |
 | `simulate_second_order(controller, leader_traj, init_pos, T, dt)` | 二阶积分器仿真 (RK45)，返回 (t, pos_history, errors, control_inputs) |
 | `simulate_first_order_cbf(controller, init_pos, leader_traj, T, dt, cbf_filter)` | 一阶积分器 + CBF 碰撞避免 (前向 Euler)，返回 (t, pos, err, ctrl, cbf_data) || `simulate_first_order_eso(controller, init_pos, leader_traj, T, dt, wind, eso)` | 一阶积分器 + 风扰动 + ESO 补偿 (前向 Euler)，返回 (t, pos, err, ctrl, eso_data) |
+| `simulate_second_order_et(controller, init_pos, init_vel, leader_traj, T, dt, et_manager)` | 二阶积分器 + 事件触发通信 (前向 Euler)，返回 (t, pos, err, ctrl, et_data) |
 #### 可视化函数
 
 | 函数 | 输出文件 | 内容 |
@@ -378,6 +413,9 @@ create_leader_trajectory(phases) → callable(t) → positions
 | (main 内CBF分析) | fig10_cbf_analysis.png | 约束激活数 + 修正幅度 + 控制量 + 成对距离 |
 | (main 内ESO抗扰) | fig11_eso_disturbance_rejection.png | 扰动估计 + 估计误差 + 三场景误差对比 + 控制量 |
 | (main 内ESO带宽) | fig12_eso_bandwidth_comparison.png | 不同 w0 下误差收敛 + 稳态估计精度 |
+| (main 内ET误差) | fig13_et_error_comparison.png | 连续通信 vs 事件触发 误差收敛对比 |
+| (main 内ET分析) | fig14_et_communication_analysis.png | 触发时间线 + 累积计数 + 各Agent通信率 + φ_i 演化 |
+| (main 内ET参数) | fig15_et_parameter_comparison.png | μ 参数扫描对比 |
 
 ### 5.6 `collision_avoidance.py` — CBF 碰撞避免
 
@@ -426,6 +464,48 @@ class ExtendedStateObserver:
 | `ExtendedStateObserver.reset(p_f_init)` | 用当前位置初始化 z₁, z₂=0 |
 | `ExtendedStateObserver.update(p_f, u_applied, dt)` | ESO 一步更新，返回扰动估计 z₂ |
 | `ExtendedStateObserver.disturbance_estimate()` | 返回当前 z₂ |
+
+### 5.8 `event_trigger.py` — 自适应事件触发通信
+
+```python
+class EventTriggerManager:
+    def __init__(self, n_agents, leader_indices, Omega_ff, mu=0.01,
+                 varpi=0.5, phi_0=1.0)
+```
+
+| 方法 | 功能 |
+|------|------|
+| `reset(positions)` | 初始化广播位置 p̂ = p，重置 φ 和触发记录 |
+| `check_and_trigger(t, positions)` | 检查触发条件，满足时更新 p̂_i，返回 (triggered_list, errors_sq) |
+| `update_phi(errors_sq, dt)` | 更新自适应参数 φ̇_i = ‖e_i‖² |
+| `update_leaders(p_l)` | 更新 leader 广播位置（leader 直接广播） |
+| `communication_rates()` | 返回各 agent 通信率统计 dict (per_agent%, mean%, total_triggers) |
+
+### 5.9 `random_test.py` — 随机初始状态 + 复杂仿射变换测试
+
+独立测试模块，从完全随机初始位置出发，测试多种复杂仿射变换。
+
+#### 变换库 `TRANSFORM_LIBRARY`
+
+| 变换 key | 名称 | det(A) |
+|----------|------|--------|
+| `scale_uniform` | 均匀缩放 2x | 8.0 |
+| `scale_nonuniform` | 非均匀缩放 (1.5, 0.8, 1.2) | 1.44 |
+| `rotate_z45` | 绕 z 轴旋转 45° | 1.0 |
+| `rotate_oblique` | 绕 (1,1,1) 轴旋转 60° | 1.0 |
+| `shear_xy` | 剪切 sxy=0.4, sxz=0.2 | 1.0 |
+| `reflect_xy` | 关于 xy 平面反射 (z 翻转) | -1.0 |
+| `general` | 一般仿射: 缩放+旋转+剪切 | 1.287 |
+
+#### 主要函数
+
+| 函数 | 功能 |
+|------|------|
+| `random_initial_positions(nominal, sigma, rng)` | 以标称中心为基准生成高斯随机初始位置 |
+| `run_single_test(controller, ..., transform_keys, seed)` | 单次随机测试：随机初始 → 多阶段复杂变换 → 验证仿射不变性 |
+| `monte_carlo_test(controller, ..., n_trials)` | n 次 Monte Carlo 随机试验，返回统计摘要 |
+| `plot_single_result(result, ...)` | 绘制误差曲线 + 初始/最终编队 3D 对比 |
+| `plot_monte_carlo(results, summary, ...)` | 绘制误差曲线叠加 + 分布直方图 + 仿射不变性验证 |
 
 ### 5.5 `animate_sim.py` — 3D 动画
 
@@ -498,6 +578,44 @@ class ExtendedStateObserver:
 - **领航者**: [0, 1, 2, 5] — 底层3个 + 顶层1个，空间上不共面
 - **跟随者**: [3, 4, 6, 7, 8, 9]
 - **关键修复**: 原始双正五边形有 5-fold 旋转对称性导致 rank 不足；旋转上层打破对称性后 rank=6
+
+### 6.5 事件触发通信结果（二阶积分器）
+
+| 指标 | 连续通信 | 事件触发 |
+|------|---------|---------|
+| 最终编队误差 | 1.1797 | 1.2027 |
+| 通信次数 | 10206 | 396 |
+| 平均通信率 | 100% | 3.88% |
+| **通信节省** | — | **96.1%** |
+
+各 Follower 通信率均匀分布在 3.59%~4.06% 之间。
+
+结论：收敛精度仅下降约 2%，但通信量减少 96%，自适应事件触发显著降低通信负担。
+
+### 6.6 随机测试结果（复杂仿射变换）
+
+**Monte Carlo 测试** (20 次, σ=2.5, 非均匀缩放+斜轴旋转+剪切):
+
+| 指标 | 值 |
+|------|-----|
+| 最终误差均值 | 0.7083 ± 0.0903 |
+| 最终误差最大 | 0.9048 |
+| 仿射不变性误差 | ~1e-14（机器精度） |
+| 全部收敛 | ✓ |
+
+**各变换类型逐个测试**:
+
+| 变换类型 | 最终误差 | det(A) | 仿射不变性误差 |
+|---------|---------|--------|--------------|
+| 均匀缩放 2x | 2.05 | 8.0 | 2e-14 |
+| 非均匀缩放 (1.5,0.8,1.2) | 0.88 | 1.44 | 1e-14 |
+| 绕 z 轴旋转 45° | 1.06 | 1.0 | 1e-14 |
+| 绕 (1,1,1) 轴旋转 60° | 1.52 | 1.0 | 1e-14 |
+| 剪切 sxy=0.4, sxz=0.2 | 0.71 | 1.0 | 1e-14 |
+| xy 平面反射 | 1.95 | -1.0 | 1e-14 |
+| 一般仿射组合 | 1.04 | 1.287 | 1e-14 |
+
+结论：仿射不变性在所有变换类型下成立至机器精度，验证了 AFC 理论的正确性。仿射变换不限于旋转和缩放，还包括剪切、反射、非均匀缩放及其任意组合。
 
 ---
 
@@ -609,6 +727,37 @@ class ExtendedStateObserver:
     - fig11: 扰动估计精度 + 编队误差对比 + 控制量
     - fig12: 不同 ESO 带宽 (w0=2/5/8/15) 对比
     - 有扰动无ESO 误差 3.62m → 有ESO 0.63m，降低 82.6%
+
+### 阶段 10：事件触发通信（二阶积分器）
+
+26. **事件触发通信模块** (`event_trigger.py`):
+    - `EventTriggerManager` 类: 自适应阈值事件触发
+    - 触发条件: $\|e_i\|^2 > \frac{1}{\varphi_i}\|\hat{\xi}_i\|^2 + \mu e^{-\varpi t}$
+    - 自适应参数 φ_i 单调递增，Zeno-free 保证
+    - 参考文献: Liu et al. (arXiv:2506.16797, 2025), Yi et al. (Automatica, 2016)
+
+27. **二阶积分器仿真** (`main_sim.py`):
+    - 新增 `simulate_second_order_et()` 函数（前向 Euler + ET）
+    - 控制律: $u_i = -K_p \sum_j \omega_{ij}(\hat{p}_i - \hat{p}_j) - K_d v_i$
+    - 自身位置用实时值、邻居位置用广播值
+    - Step 7.7: 连续通信 vs 事件触发对比
+    - fig13: 误差对比, fig14: 通信分析四面板, fig15: μ 参数扫描
+    - 通信节省 96.1%，误差仅增加 2%
+
+### 阶段 11：随机测试与复杂仿射变换
+
+28. **随机测试模块** (`random_test.py`):
+    - 完全随机初始位置（高斯分布，σ=1.5~2.5m）
+    - 7 种仿射变换: 均匀/非均匀缩放、z轴/斜轴旋转、剪切、反射、一般组合
+    - `run_single_test()`: 单次多阶段变换序列测试
+    - `monte_carlo_test()`: 20 次 Monte Carlo 随机试验
+    - 可视化: 误差曲线 + 3D 编队对比 + 统计直方图
+
+29. **复杂仿射变换验证**:
+    - 剪切变换 (sxy=0.4, sxz=0.2): 仿射不变性误差 ~1e-14 ✓
+    - 反射变换 (det(A)=-1): 仿射不变性误差 ~1e-14 ✓
+    - 4 重组合 (非均匀缩放→斜轴旋转→剪切→一般仿射): 收敛 ✓
+    - Monte Carlo 20 次全部收敛，误差 0.71 ± 0.09
 ---
 
 ## 八、已识别的局限性与改进方向
@@ -629,12 +778,14 @@ class ExtendedStateObserver:
 1. **鲁棒抗扰**: 引入 ISS (Input-to-State Stability), H∞ 控制, 自抗扰控制 (ADRC)
 2. **自适应重构**: 动态拓扑切换, 在线应力矩阵更新, 领航者故障恢复
 3. **异构动力学**: 四旋翼二阶/非线性模型, CBF 碰撞避免
-4. **通信约束**: 事件触发通信, 量化/延迟/丢包建模, 分布式应力矩阵估计
+4. **通信约束**: ~~事件触发通信~~, 量化/延迟/丢包建模, 分布式应力矩阵估计
 
 ### 已解决的局限性
 
 - ~~输入无约束~~: 已实现 smooth/norm/clip 三种饱和模式，支持 Crazyflie 速度限制 (u_max=1.0 m/s)
 - ~~无碰撞避免~~: 已实现 CBF-QP 安全滤波器，保证智能体间距 ≥ d_s=0.2m，仅在 24% 时步激活约束- ~~无环境扰动~~: 已实现 ESO 扩展状态观测器，在 [0.2, 0.1, 0.05] m/s 风场 + OU 阵风下编队误差降低 82.6%
+- ~~连续通信假设~~: 已实现自适应事件触发通信（二阶积分器），通信量减少 96.1%，误差仅增加 2%
+- ~~仅旋转/缩放变换~~: 已验证剪切、反射、非均匀缩放、一般仿射组合等复杂变换均成立（仿射不变性误差 ~1e-14）
 ---
 
 ## 九、参考文献索引

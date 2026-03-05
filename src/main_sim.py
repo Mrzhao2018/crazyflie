@@ -35,6 +35,7 @@ from afc_controller import AFCController
 from archive import SimArchive
 from collision_avoidance import CBFSafetyFilter, CRAZYFLIE_SAFETY
 from disturbance_observer import ExtendedStateObserver, WindDisturbance
+from event_trigger import EventTriggerManager
 
 # 设置中文字体
 plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei', 'DejaVu Sans']
@@ -375,6 +376,142 @@ def simulate_first_order_eso(controller, initial_positions, leader_traj_func,
         'estimation_errors': est_errors,
     }
     return times, positions_history, errors, control_inputs, eso_data
+
+
+def simulate_second_order_et(controller, initial_positions,
+                              initial_velocities, leader_traj_func,
+                              t_span, dt=0.02, et_manager=None):
+    """
+    二阶积分器仿真 + 自适应事件触发通信。
+
+    动力学：p̈_f = u_f
+    控制律：u_i = -K_p Σ_j ω_ij(p_i - p̂_j) - K_d v_i
+      位置编队偏差项使用邻居广播位置 p̂_j，阻尼项使用本地实时速度 v_i。
+
+    矩阵形式 (等价)：
+      u_f = -K_p (Ω_ff p̂_f + Ω_fl p̂_l) - K_p Ω_ff (p_f - p̂_f) - K_d v_f
+
+    Parameters
+    ----------
+    controller : AFCController
+    initial_positions : ndarray (n, d)
+    initial_velocities : ndarray (n, d) or None
+    leader_traj_func : callable
+    t_span : (float, float)
+    dt : float
+    et_manager : EventTriggerManager or None
+        None 时退化为连续通信（二阶积分器 Euler 积分基线）
+
+    Returns
+    -------
+    times : ndarray (n_steps,)
+    positions_history : ndarray (n_steps, n, d)
+    errors : ndarray (n_steps,)
+    control_inputs : ndarray (n_steps, n_f, d)
+    et_data : dict
+        trigger_log, trigger_counts, comm_rates, phi_history
+    """
+    n = controller.n
+    d = initial_positions.shape[1]
+    f_idx = controller.follower_indices
+    l_idx = controller.leader_indices
+    n_f = controller.n_f
+
+    Omega_ff = controller.Omega_ff
+    Omega_fl = controller.Omega_fl
+
+    times = np.arange(t_span[0], t_span[1] + dt / 2, dt)
+    n_steps = len(times)
+
+    positions_history = np.zeros((n_steps, n, d))
+    velocities_history = np.zeros((n_steps, n, d))
+    errors = np.zeros(n_steps)
+    control_inputs = np.zeros((n_steps, n_f, d))
+    phi_history = np.zeros((n_steps, n_f))
+
+    positions = initial_positions.copy()
+    velocities = (initial_velocities.copy() if initial_velocities is not None
+                  else np.zeros_like(initial_positions))
+
+    # 初始化 ET 管理器
+    if et_manager is not None:
+        et_manager.reset(positions)
+
+    for idx in range(n_steps):
+        t = times[idx]
+        p_l = leader_traj_func(t)
+        positions[l_idx] = p_l
+        velocities[l_idx] = 0.0  # Leader 速度由轨迹决定（忽略）
+        positions_history[idx] = positions.copy()
+        velocities_history[idx] = velocities.copy()
+
+        p_f = positions[f_idx]
+        v_f = velocities[f_idx]
+
+        if et_manager is not None:
+            # Leader 广播位置直接更新
+            et_manager.update_leaders(p_l)
+            # 检查 follower 触发条件
+            triggered, errors_sq = et_manager.check_and_trigger(t, positions)
+            phi_history[idx] = et_manager.phi.copy()
+
+            # 使用广播位置计算编队偏差
+            p_f_hat = et_manager.p_hat[f_idx]
+            p_l_hat = et_manager.p_hat[l_idx]
+
+            # u = -K_p(Ω_ff p̂_f + Ω_fl p̂_l) - K_p Ω_ff (p_f - p̂_f) - K_d v_f
+            #   = -K_p(Ω_ff p_f + Ω_fl p̂_l + Ω_ff(p̂_f - p_f) + Ω_ff(p_f - p̂_f)) 简化为
+            #   = -K_p(Ω_ff p_f + Ω_fl p̂_l) - K_d v_f
+            # 但邻居 j 的位置仍是 p̂_j，所以展开：
+            u_f = -controller.gain * (Omega_ff @ p_f_hat + Omega_fl @ p_l_hat)
+            # 修正自身位置：自身用实时值 p_i，邻居用广播值 p̂_j
+            # 即 Ω_ff 行的对角项用 p_i - p̂_i 修正
+            e_f = p_f - p_f_hat  # (n_f, d) 自身广播误差
+            u_f -= controller.gain * np.diag(np.diag(Omega_ff)) @ e_f
+
+            # 阻尼项（本地实时速度）
+            u_f -= controller.damping * v_f
+            u_f = controller.saturate(u_f)
+
+            # 更新自适应参数
+            et_manager.update_phi(errors_sq, dt)
+        else:
+            # 连续通信基线
+            u_f = -controller.gain * (Omega_ff @ p_f + Omega_fl @ p_l)
+            u_f -= controller.damping * v_f
+            u_f = controller.saturate(u_f)
+
+        control_inputs[idx] = u_f
+
+        # 编队误差
+        p_f_star = controller.steady_state(p_l)
+        errors[idx] = np.linalg.norm(p_f - p_f_star)
+
+        # 前向 Euler 积分（二阶）
+        if idx < n_steps - 1:
+            velocities[f_idx] = v_f + dt * u_f
+            positions[f_idx] = p_f + dt * velocities[f_idx]
+
+    # ET 统计
+    if et_manager is not None:
+        comm_rates = et_manager.communication_rates()
+        et_data = {
+            'trigger_log': et_manager.trigger_log.copy(),
+            'trigger_counts': et_manager.trigger_counts.copy(),
+            'comm_rates': comm_rates,
+            'phi_history': phi_history,
+        }
+    else:
+        et_data = {
+            'trigger_log': [],
+            'trigger_counts': np.zeros(n, dtype=int),
+            'comm_rates': {'per_agent': np.zeros(n_f), 'mean': 100.0,
+                           'total_triggers': n_f * n_steps,
+                           'total_possible': n_f * n_steps},
+            'phi_history': np.zeros((n_steps, n_f)),
+        }
+
+    return times, positions_history, errors, control_inputs, et_data
 
 
 # ============================================================
@@ -1339,6 +1476,226 @@ def main():
     print("  已保存: fig12_eso_bandwidth_comparison.png")
 
     # ----------------------------------------------------------
+    # Step 7.7: 自适应事件触发通信验证（二阶积分器）
+    # ----------------------------------------------------------
+    print("\n[Step 7.7] 自适应事件触发通信验证 (二阶积分器)...")
+
+    # ET 参数
+    et_mu = 0.01        # 指数衰减项系数
+    et_varpi = 0.5      # 指数衰减速率
+    et_phi_0 = 1.0      # 自适应参数初始值
+    K_d = controller.damping
+
+    print(f"  动力学模型: 二阶积分器 p̈_f = u_f")
+    print(f"  增益: K_p = {gain}, K_d = {K_d}")
+    print(f"  ET 参数: μ = {et_mu}, ϖ = {et_varpi}, φ₀ = {et_phi_0}")
+
+    # 初始速度为零
+    init_vel = np.zeros_like(init_pos)
+
+    # --- 基线: 二阶积分器 + 连续通信 (Euler 积分) ---
+    print("  运行二阶基线 (连续通信, Euler)...")
+    (times_2nd_cont, pos_2nd_cont, err_2nd_cont,
+     ctrl_2nd_cont, et_data_cont) = simulate_second_order_et(
+        controller, init_pos, init_vel, leader_traj, (0, T_total), dt=dt,
+        et_manager=None,
+    )
+    print(f"    最终误差: {err_2nd_cont[-1]:.6f}")
+
+    # --- 自适应事件触发 ---
+    print("  运行二阶自适应事件触发...")
+    et_mgr = EventTriggerManager(
+        n_agents=10, d=d,
+        follower_indices=follower_indices,
+        leader_indices=leader_indices,
+        Omega=Omega,
+        mu=et_mu, varpi=et_varpi, phi_0=et_phi_0,
+    )
+    (times_2nd_et, pos_2nd_et, err_2nd_et,
+     ctrl_2nd_et, et_data_et) = simulate_second_order_et(
+        controller, init_pos, init_vel, leader_traj, (0, T_total), dt=dt,
+        et_manager=et_mgr,
+    )
+    print(f"    最终误差: {err_2nd_et[-1]:.6f}")
+
+    # 通信率统计
+    comm = et_data_et['comm_rates']
+    print(f"\n  === 事件触发通信效果 ===")
+    print(f"  平均通信率: {comm['mean']:.2f}%")
+    print(f"  总触发次数: {comm['total_triggers']} / {comm['total_possible']} "
+          f"(连续通信需 {comm['total_possible']})")
+    print(f"  各 Follower 通信率:")
+    for i_loc, fi in enumerate(follower_indices):
+        print(f"    Agent {fi}: {comm['per_agent'][i_loc]:.2f}% "
+              f"({et_data_et['trigger_counts'][fi]} 次)")
+    print(f"  通信节省: {100 - comm['mean']:.1f}%")
+
+    # ==== 图13: 事件触发 vs 连续通信误差对比 ====
+    fig13, axes13 = plt.subplots(2, 1, figsize=(14, 8))
+
+    # (a) 编队误差对比
+    axes13[0].semilogy(times_2nd_cont, err_2nd_cont + 1e-16, 'b-',
+                       linewidth=1.5, label='连续通信 (100%)')
+    axes13[0].semilogy(times_2nd_et, err_2nd_et + 1e-16, 'r-',
+                       linewidth=1.5,
+                       label=f'事件触发 ({comm["mean"]:.1f}%)')
+    axes13[0].set_xlabel('时间 (s)')
+    axes13[0].set_ylabel('编队误差 ||p_f - p_f*||')
+    axes13[0].set_title('(a) 二阶积分器编队误差收敛对比', fontsize=11)
+    axes13[0].legend()
+    axes13[0].grid(True, alpha=0.3)
+    axes13[0].set_xlim([0, T_total])
+    for i in range(len(phase_labels)):
+        if i < len(phase_times) - 1:
+            axes13[0].axvspan(phase_times[i], phase_times[i + 1],
+                              alpha=0.1, color=colors[i % len(colors)])
+
+    # (b) 控制输入范数对比
+    ctrl_norm_cont = np.linalg.norm(ctrl_2nd_cont, axis=2).max(axis=1)
+    ctrl_norm_et = np.linalg.norm(ctrl_2nd_et, axis=2).max(axis=1)
+    axes13[1].plot(times_2nd_cont, ctrl_norm_cont, 'b-', linewidth=1.0,
+                   alpha=0.7, label='连续通信')
+    axes13[1].plot(times_2nd_et, ctrl_norm_et, 'r-', linewidth=1.0,
+                   alpha=0.7, label='事件触发')
+    axes13[1].axhline(y=u_max, color='gray', linestyle='--', linewidth=1.5,
+                      alpha=0.5, label=f'u_max={u_max}')
+    axes13[1].set_xlabel('时间 (s)')
+    axes13[1].set_ylabel('max ||u_i|| (m/s²)')
+    axes13[1].set_title('(b) 最大控制输入对比', fontsize=11)
+    axes13[1].legend()
+    axes13[1].grid(True, alpha=0.3)
+    axes13[1].set_xlim([0, T_total])
+
+    fig13.suptitle('自适应事件触发通信 vs 连续通信 (二阶积分器)', fontsize=14)
+    fig13.tight_layout()
+    fig13.savefig('e:/crazyflie/src/fig13_et_error_comparison.png',
+                  dpi=200, bbox_inches='tight')
+    archive.save_figure(fig13, 'fig13_et_error_comparison')
+    print("  已保存: fig13_et_error_comparison.png")
+
+    # ==== 图14: 事件触发时间线与通信分析 ====
+    fig14, axes14 = plt.subplots(2, 2, figsize=(16, 10))
+
+    # (a) 触发事件时间线
+    for i_loc, fi in enumerate(follower_indices):
+        t_events = [ev[0] for ev in et_data_et['trigger_log'] if ev[1] == fi]
+        if t_events:
+            axes14[0, 0].eventplot([t_events], lineoffsets=fi,
+                                    linelengths=0.6, colors=[f'C{i_loc}'])
+    axes14[0, 0].set_xlabel('时间 (s)')
+    axes14[0, 0].set_ylabel('Agent ID')
+    axes14[0, 0].set_title('(a) 各 Follower 触发事件时间线', fontsize=11)
+    axes14[0, 0].set_yticks(follower_indices)
+    axes14[0, 0].grid(True, alpha=0.3, axis='x')
+    axes14[0, 0].set_xlim([0, T_total])
+    for i in range(len(phase_labels)):
+        if i < len(phase_times) - 1:
+            axes14[0, 0].axvspan(phase_times[i], phase_times[i + 1],
+                                  alpha=0.08, color=colors[i % len(colors)])
+
+    # (b) 累积通信次数
+    for i_loc, fi in enumerate(follower_indices):
+        t_events = sorted([ev[0] for ev in et_data_et['trigger_log']
+                           if ev[1] == fi])
+        cum_count = np.arange(1, len(t_events) + 1)
+        if t_events:
+            axes14[0, 1].step(t_events, cum_count, where='post',
+                              linewidth=1.2, label=f'Agent {fi}')
+    # 连续通信基线
+    axes14[0, 1].plot([0, T_total], [0, len(times_2nd_cont)], 'k--',
+                      linewidth=1.5, alpha=0.4, label='连续通信')
+    axes14[0, 1].set_xlabel('时间 (s)')
+    axes14[0, 1].set_ylabel('累积通信次数')
+    axes14[0, 1].set_title('(b) 累积通信次数', fontsize=11)
+    axes14[0, 1].legend(fontsize=8)
+    axes14[0, 1].grid(True, alpha=0.3)
+    axes14[0, 1].set_xlim([0, T_total])
+
+    # (c) 各 agent 通信率柱状图
+    bar_x = np.arange(len(follower_indices))
+    bar_vals = comm['per_agent']
+    bar_colors = [f'C{i}' for i in range(len(follower_indices))]
+    bars14 = axes14[1, 0].bar(bar_x, bar_vals, color=bar_colors,
+                               edgecolor='black', linewidth=0.5)
+    axes14[1, 0].axhline(y=100, color='gray', linestyle='--', linewidth=1.5,
+                          alpha=0.4, label='连续通信 (100%)')
+    axes14[1, 0].axhline(y=comm['mean'], color='red', linestyle='-.',
+                          linewidth=1.5, alpha=0.7,
+                          label=f'ET 平均 ({comm["mean"]:.1f}%)')
+    axes14[1, 0].set_xlabel('Follower Agent ID')
+    axes14[1, 0].set_ylabel('通信率 (%)')
+    axes14[1, 0].set_title('(c) 各 Follower 通信率', fontsize=11)
+    axes14[1, 0].set_xticks(bar_x)
+    axes14[1, 0].set_xticklabels(follower_indices)
+    axes14[1, 0].legend()
+    axes14[1, 0].grid(True, alpha=0.3, axis='y')
+
+    # (d) 自适应参数 φ_i 演化
+    for i_loc, fi in enumerate(follower_indices):
+        axes14[1, 1].plot(times_2nd_et,
+                          et_data_et['phi_history'][:, i_loc],
+                          linewidth=1.2, label=f'Agent {fi}')
+    axes14[1, 1].set_xlabel('时间 (s)')
+    axes14[1, 1].set_ylabel('φ_i(t)')
+    axes14[1, 1].set_title('(d) 自适应参数 φ_i 演化', fontsize=11)
+    axes14[1, 1].legend(fontsize=8)
+    axes14[1, 1].grid(True, alpha=0.3)
+    axes14[1, 1].set_xlim([0, T_total])
+
+    fig14.suptitle(f'自适应事件触发通信分析 '
+                   f'(μ={et_mu}, ϖ={et_varpi}, φ₀={et_phi_0})', fontsize=14)
+    fig14.tight_layout()
+    fig14.savefig('e:/crazyflie/src/fig14_et_communication_analysis.png',
+                  dpi=200, bbox_inches='tight')
+    archive.save_figure(fig14, 'fig14_et_communication_analysis')
+    print("  已保存: fig14_et_communication_analysis.png")
+
+    # ==== 图15: 不同 ET 参数对比 ====
+    mu_values = [0.001, 0.01, 0.1]
+    fig15, axes15 = plt.subplots(1, 2, figsize=(14, 5))
+
+    for mu_v in mu_values:
+        et_cmp = EventTriggerManager(
+            n_agents=10, d=d,
+            follower_indices=follower_indices,
+            leader_indices=leader_indices,
+            Omega=Omega,
+            mu=mu_v, varpi=et_varpi, phi_0=et_phi_0,
+        )
+        (t_cmp, _, err_cmp, _, et_data_cmp) = simulate_second_order_et(
+            controller, init_pos, init_vel, leader_traj, (0, T_total), dt=dt,
+            et_manager=et_cmp,
+        )
+        cr = et_data_cmp['comm_rates']['mean']
+        axes15[0].semilogy(t_cmp, err_cmp + 1e-16, linewidth=1.5,
+                           label=f'μ={mu_v} ({cr:.1f}%)')
+        axes15[1].bar(f'μ={mu_v}', cr, alpha=0.7, edgecolor='black',
+                      linewidth=0.5)
+
+    # 连续通信基线
+    axes15[0].semilogy(times_2nd_cont, err_2nd_cont + 1e-16, 'k--',
+                       linewidth=1.5, alpha=0.5, label='连续通信')
+    axes15[0].set_xlabel('时间 (s)')
+    axes15[0].set_ylabel('编队误差')
+    axes15[0].set_title('(a) 不同 μ 下的误差收敛', fontsize=11)
+    axes15[0].legend()
+    axes15[0].grid(True, alpha=0.3)
+    axes15[0].set_xlim([0, T_total])
+
+    axes15[1].axhline(y=100, color='gray', linestyle='--', linewidth=1.5,
+                      alpha=0.4)
+    axes15[1].set_ylabel('平均通信率 (%)')
+    axes15[1].set_title('(b) 通信率对比', fontsize=11)
+    axes15[1].grid(True, alpha=0.3, axis='y')
+
+    fig15.suptitle('ET 参数 μ 对性能的影响', fontsize=14)
+    fig15.tight_layout()
+    fig15.savefig('e:/crazyflie/src/fig15_et_parameter_comparison.png',
+                  dpi=200, bbox_inches='tight')
+    archive.save_figure(fig15, 'fig15_et_parameter_comparison')
+    print("  已保存: fig15_et_parameter_comparison.png")
+
+    # ----------------------------------------------------------
     # Step 8: 验证仿射不变性
     # ----------------------------------------------------------
     print("\n[Step 8] 仿射不变性验证...")
@@ -1408,6 +1765,9 @@ def main():
         eso_errors_with_eso=err_eso_wd,
         eso_disturbances_true=eso_data_wd['disturbances_true'],
         eso_disturbances_est=eso_data_wd['disturbances_est'],
+        et_errors_continuous=err_2nd_cont,
+        et_errors_triggered=err_2nd_et,
+        et_phi_history=et_data_et['phi_history'],
     )
 
     # 保存应力矩阵与邻接矩阵
@@ -1481,6 +1841,20 @@ def main():
         },
         'stress_matrix_validation': results,
         'eigenvalues_omega': eigvals.tolist(),
+        'event_triggered_communication': {
+            'model': 'second_order_integrator',
+            'mu': et_mu,
+            'varpi': et_varpi,
+            'phi_0': et_phi_0,
+            'K_d': K_d,
+            'mean_comm_rate_pct': comm['mean'],
+            'total_triggers': comm['total_triggers'],
+            'total_possible': comm['total_possible'],
+            'per_agent_comm_rate': comm['per_agent'].tolist(),
+            'final_error_continuous': float(err_2nd_cont[-1]),
+            'final_error_et': float(err_2nd_et[-1]),
+            'comm_saving_pct': 100 - comm['mean'],
+        },
     })
 
     archive.finalize()
