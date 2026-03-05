@@ -1,6 +1,6 @@
 # 项目文档：基于Crazyflie开发平台的微型无人机编队控制研究
 
-> **最后更新**: 2025年7月 → 2026年3月05日 → 3月06日  
+> **最后更新**: 2025年7月 → 2026年3月05日 → 3月06日 (新增 ESO 鲁棒抗扰)  
 > **目的**: 记录项目所有已实现功能、开发环境、代码架构和开发进程，避免每次重新阅读全部代码
 
 ---
@@ -79,7 +79,8 @@ e:\crazyflie\
     ├── stress_matrix.py        # 应力矩阵计算（~570行）
     ├── afc_controller.py       # AFC 控制器 + 输入饱和（~260行）
     ├── formation.py            # 编队定义与仿射工具（~460行）
-    ├── main_sim.py             # 仿真主程序（~780行）
+    ├── main_sim.py             # 仿真主程序（~1490行）
+    ├── disturbance_observer.py # ESO 扰动观测器 + 风场模型（~170行）
     ├── animate_sim.py          # 3D 动画生成（~270行）
     ├── fig1_formation_snapshots.png  # 编队快照
     ├── fig2_trajectories_3d.png     # 3D 轨迹
@@ -89,6 +90,10 @@ e:\crazyflie\
     ├── fig6_sparse_comparison.png   # 通信指标对比
     ├── fig7_saturation_analysis.png # 输入饱和分析
     ├── fig8_saturation_comparison.png # 不同饱和上限对比
+    ├── fig9_cbf_collision_avoidance.png  # CBF 碞撞避免效果
+    ├── fig10_cbf_analysis.png           # CBF 分析面板
+    ├── fig11_eso_disturbance_rejection.png # ESO 扰动估计与补偿
+    ├── fig12_eso_bandwidth_comparison.png  # ESO 带宽对比
     ├── afc_animation.gif            # 动画 GIF
     └── afc_animation.mp4            # 动画 MP4
 ```
@@ -190,6 +195,41 @@ $$\min_{u_f} \|u_f - u_f^{\text{nom}}\|^2 \quad \text{s.t.}$$
 - 安全距离 $d_s = 0.2$ m（考虑机架 92mm + 桨叶气流 + 定位误差）
 - 激活距离 $d_a = 0.6$ m（仅近邻对触发 QP 约束）
 - CBF 衰减率 $\gamma = 3.0$
+
+### 4.7 ESO 鲁棒抗扰（扩展状态观测器）
+
+基于扩展状态观测器 (Extended State Observer, ESO) 的主动抗扰补偿 (Han, IEEE T-IE 2009; Wang et al., Int. J. Robust Nonlinear Control 2020).
+
+**含扰动系统模型**:
+
+$$\dot{p}_f = u_f + w_f(t)$$
+
+其中 $w_f(t)$ 为有界外部扰动（风场干扰等）。
+
+**ESO 设计**（对每个跟随者）:
+
+$$\dot{z}_1^i = u_i + z_2^i + \beta_1(p_i - z_1^i)$$
+$$\dot{z}_2^i = \beta_2(p_i - z_1^i)$$
+
+其中 $z_1^i$ 估计位置 $p_i$，$z_2^i$ 估计扰动 $w_i$。
+
+**Han 参数化**: $\beta_1 = 2\omega_0, \beta_2 = \omega_0^2$，$\omega_0$ 为观测器带宽。
+
+**补偿控制律**:
+
+$$u_i = u_{\text{nom},i} - z_2^i = -K_p \sum_j \omega_{ij}(p_i - p_j) - z_2^i$$
+
+当 ESO 收敛 ($z_2^i \to w_i$) 后，闭环等效为 $\dot{p}_i \approx u_{\text{nom},i}$，消除扰动影响。
+
+**风场扰动模型**: $w(t) = w_{\text{const}} + w_{\text{OU}}(t)$
+- 恒定分量 $w_{\text{const}}$: 稳定侧风
+- OU 过程 $w_{\text{OU}}$: $dw = -\theta w dt + \sigma dW$（有色噪声，模拟阵风）
+
+**无 ESO 稳态误差分析**: 在恒定扰动 $w$ 下，无补偿系统的稳态偏差为
+
+$$\delta_f = \Omega_{ff}^{-1} w / K_p$$
+
+由于 $\lambda_{\min}(\Omega_{ff}) = 0.024$ 较小，$\|\delta_f\| \propto 1/\lambda_{\min}$ 很大，系统对扰动敏感。
 
 ### 4.4 稀疏通信图设计（4 阶段算法）
 
@@ -321,8 +361,7 @@ create_leader_trajectory(phases) → callable(t) → positions
 |------|------|
 | `simulate_first_order(controller, leader_traj, init_pos, T, dt)` | 一阶积分器仿真 (RK45)，返回 (t, pos_history, errors, control_inputs) |
 | `simulate_second_order(controller, leader_traj, init_pos, T, dt)` | 二阶积分器仿真 (RK45)，返回 (t, pos_history, errors, control_inputs) |
-| `simulate_first_order_cbf(controller, init_pos, leader_traj, T, dt, cbf_filter)` | 一阶积分器 + CBF 碰撞避免 (前向 Euler)，返回 (t, pos, err, ctrl, cbf_data) |
-
+| `simulate_first_order_cbf(controller, init_pos, leader_traj, T, dt, cbf_filter)` | 一阶积分器 + CBF 碰撞避免 (前向 Euler)，返回 (t, pos, err, ctrl, cbf_data) || `simulate_first_order_eso(controller, init_pos, leader_traj, T, dt, wind, eso)` | 一阶积分器 + 风扰动 + ESO 补偿 (前向 Euler)，返回 (t, pos, err, ctrl, eso_data) |
 #### 可视化函数
 
 | 函数 | 输出文件 | 内容 |
@@ -337,6 +376,8 @@ create_leader_trajectory(phases) → callable(t) → positions
 | (main 内饱和对比) | fig8_saturation_comparison.png | 不同 u_max 下误差 + 控制量对比 |
 | (main 内CBF对比) | fig9_cbf_collision_avoidance.png | 最小距离 + 误差收敛 (有/无CBF) |
 | (main 内CBF分析) | fig10_cbf_analysis.png | 约束激活数 + 修正幅度 + 控制量 + 成对距离 |
+| (main 内ESO抗扰) | fig11_eso_disturbance_rejection.png | 扰动估计 + 估计误差 + 三场景误差对比 + 控制量 |
+| (main 内ESO带宽) | fig12_eso_bandwidth_comparison.png | 不同 w0 下误差收敛 + 稳态估计精度 |
 
 ### 5.6 `collision_avoidance.py` — CBF 碰撞避免
 
@@ -366,6 +407,25 @@ class CBFSafetyFilter:
 2. 对近邻对构建线性约束 Cu ≥ b
 3. 无约束时直接返回 u_nom（零开销）
 4. 有约束时求解 QP，返回最接近 u_nom 的安全控制
+
+### 5.7 `disturbance_observer.py` — ESO 扰动观测器
+
+```python
+class WindDisturbance:
+    def __init__(self, n_agents, dim=3, w_const=None, ou_theta=0.5, ou_sigma=0.1, seed=None)
+
+class ExtendedStateObserver:
+    def __init__(self, n_agents, dim=3, omega_o=8.0)
+```
+
+| 类/方法 | 功能 |
+|---------|------|
+| `WindDisturbance.step(dt)` | 推进 OU 过程一步，返回当前扰动 (n_agents, dim) |
+| `WindDisturbance.current()` | 返回当前扰动（不推进） |
+| `WindDisturbance.reset()` | 重置 OU 状态 |
+| `ExtendedStateObserver.reset(p_f_init)` | 用当前位置初始化 z₁, z₂=0 |
+| `ExtendedStateObserver.update(p_f, u_applied, dt)` | ESO 一步更新，返回扰动估计 z₂ |
+| `ExtendedStateObserver.disturbance_estimate()` | 返回当前 z₂ |
 
 ### 5.5 `animate_sim.py` — 3D 动画
 
@@ -536,7 +596,19 @@ class CBFSafetyFilter:
     - fig9: 最小距离 + 误差收敛对比
     - fig10: CBF 约束激活数 + 修正幅度 + 控制量 + 成对距离
     - 无 CBF 最小距离 0.107m（碰撞!）→ 有 CBF 0.225m（安全 ✓）
+### 阶段 9：ESO 鲁棒抗扰
 
+24. **ESO 扰动观测器模块** (`disturbance_observer.py`):
+    - `WindDisturbance` 类: 恒定风场 + OU 过程阵风模型
+    - `ExtendedStateObserver` 类: Han 参数化 ESO ($\beta_1=2\omega_0, \beta_2=\omega_0^2$)
+    - 将扰动视为扩展状态，实时估计并前馈补偿
+
+25. **ESO 仿真集成** (`main_sim.py`):
+    - 新增 `simulate_first_order_eso()` 函数（前向 Euler + 扰动 + ESO）
+    - Step 7.6: 三场景对比（无扰动 / 有扰动无ESO / 有扰动有ESO）
+    - fig11: 扰动估计精度 + 编队误差对比 + 控制量
+    - fig12: 不同 ESO 带宽 (w0=2/5/8/15) 对比
+    - 有扰动无ESO 误差 3.62m → 有ESO 0.63m，降低 82.6%
 ---
 
 ## 八、已识别的局限性与改进方向
@@ -548,7 +620,7 @@ class CBFSafetyFilter:
 3. **简化动力学**: 使用积分器模型，未建模四旋翼实际动力学
 4. **集中式初始化**: 应力矩阵计算需要集中式 SDP，仅控制阶段分布式
 5. **无通信延迟/丢包**: 理想通信假设
-6. **无环境扰动**: 无风力等外部干扰
+6. ~~无环境扰动~~: **已解决** — ESO 扩展状态观测器抗扰补偿 (见 4.7)
 7. **领航者追踪假设**: 领航者完美跟踪参考轨迹
 8. **固定增益**: K_p 为常数，未自适应调整
 
@@ -562,8 +634,7 @@ class CBFSafetyFilter:
 ### 已解决的局限性
 
 - ~~输入无约束~~: 已实现 smooth/norm/clip 三种饱和模式，支持 Crazyflie 速度限制 (u_max=1.0 m/s)
-- ~~无碰撞避免~~: 已实现 CBF-QP 安全滤波器，保证智能体间距 ≥ d_s=0.2m，仅在 24% 时步激活约束
-
+- ~~无碰撞避免~~: 已实现 CBF-QP 安全滤波器，保证智能体间距 ≥ d_s=0.2m，仅在 24% 时步激活约束- ~~无环境扰动~~: 已实现 ESO 扩展状态观测器，在 [0.2, 0.1, 0.05] m/s 风场 + OU 阵风下编队误差降低 82.6%
 ---
 
 ## 九、参考文献索引

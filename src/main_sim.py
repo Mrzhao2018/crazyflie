@@ -34,6 +34,7 @@ from formation import (
 from afc_controller import AFCController
 from archive import SimArchive
 from collision_avoidance import CBFSafetyFilter, CRAZYFLIE_SAFETY
+from disturbance_observer import ExtendedStateObserver, WindDisturbance
 
 # 设置中文字体
 plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei', 'DejaVu Sans']
@@ -265,6 +266,115 @@ def simulate_first_order_cbf(controller, initial_positions,
         'n_active': n_active_constraints,
     }
     return times, positions_history, errors, control_inputs, cbf_data
+
+
+def simulate_first_order_eso(controller, initial_positions, leader_traj_func,
+                              t_span, dt=0.02, wind=None, eso=None):
+    """
+    一阶积分器仿真，含外部扰动和可选 ESO 补偿。
+
+    动力学：ṗ_f = u_f + w_f(t)
+    ESO 补偿：u_f = u_nom − ẑ_w  (当 eso 不为 None 时)
+
+    Parameters
+    ----------
+    controller : AFCController
+    initial_positions : ndarray (n, d)
+    leader_traj_func : callable
+    t_span : (float, float)
+    dt : float
+    wind : WindDisturbance or None
+        风场扰动模型
+    eso : ExtendedStateObserver or None
+        扩展状态观测器（None 则不补偿）
+
+    Returns
+    -------
+    times : ndarray (n_steps,)
+    positions_history : ndarray (n_steps, n, d)
+    errors : ndarray (n_steps,)
+    control_inputs : ndarray (n_steps, n_f, d)
+    eso_data : dict
+        disturbances_true, disturbances_est, estimation_errors
+    """
+    n = controller.n
+    d = initial_positions.shape[1]
+    f_idx = controller.follower_indices
+    l_idx = controller.leader_indices
+    n_f = controller.n_f
+
+    times = np.arange(t_span[0], t_span[1] + dt / 2, dt)
+    n_steps = len(times)
+
+    positions_history = np.zeros((n_steps, n, d))
+    errors = np.zeros(n_steps)
+    control_inputs = np.zeros((n_steps, n_f, d))
+    disturbances_true = np.zeros((n_steps, n_f, d))
+    disturbances_est = np.zeros((n_steps, n_f, d))
+
+    positions = initial_positions.copy()
+
+    # 初始化 ESO
+    if eso is not None:
+        eso.reset(positions[f_idx])
+    if wind is not None:
+        wind.reset()
+
+    for idx in range(n_steps):
+        t = times[idx]
+        p_l = leader_traj_func(t)
+        positions[l_idx] = p_l
+        positions_history[idx] = positions.copy()
+
+        p_f = positions[f_idx]
+
+        # 获取当前风扰动
+        if wind is not None:
+            w = wind.current()
+            disturbances_true[idx] = w
+        else:
+            w = np.zeros((n_f, d))
+
+        # AFC 标称控制
+        u_nom = -controller.gain * (controller.Omega_ff @ p_f
+                                    + controller.Omega_fl @ p_l)
+
+        # ESO 补偿
+        if eso is not None:
+            w_hat = eso.disturbance_estimate()
+            disturbances_est[idx] = w_hat
+            u_compensated = u_nom - w_hat
+        else:
+            u_compensated = u_nom
+
+        # 饱和
+        u_sat = controller.saturate(u_compensated)
+        control_inputs[idx] = u_sat
+
+        # 编队误差
+        p_f_star = controller.steady_state(p_l)
+        errors[idx] = np.linalg.norm(p_f - p_f_star)
+
+        # 前向 Euler 积分（含扰动）
+        if idx < n_steps - 1:
+            positions[f_idx] = p_f + dt * (u_sat + w)
+
+            # 推进风场
+            if wind is not None:
+                wind.step(dt)
+
+            # 更新 ESO（用实际施加的控制和新位置）
+            if eso is not None:
+                eso.update(positions[f_idx], u_sat, dt)
+
+    est_errors = np.linalg.norm(disturbances_true - disturbances_est,
+                                axis=(1, 2))
+    eso_data = {
+        'disturbances_true': disturbances_true,
+        'disturbances_est': disturbances_est,
+        'estimation_errors': est_errors,
+    }
+    return times, positions_history, errors, control_inputs, eso_data
 
 
 # ============================================================
@@ -1032,6 +1142,203 @@ def main():
     print("  已保存: fig10_cbf_analysis.png")
 
     # ----------------------------------------------------------
+    # Step 7.6: ESO 鲁棒抗扰验证
+    # ----------------------------------------------------------
+    print("\n[Step 7.6] ESO 鲁棒抗扰验证...")
+
+    # 风场扰动参数
+    w_const_vec = np.array([0.2, 0.1, 0.05])   # 恒定侧风 (m/s)
+    ou_theta = 0.5      # OU 均值回复速率 (1/s)，τ_w = 2s
+    ou_sigma = 0.1      # OU 波动强度 (m/s)
+    wind_seed = 123
+
+    # ESO 参数
+    omega_o = 8.0       # 观测器带宽 (rad/s)
+
+    print(f"  恒定风场: {w_const_vec} m/s (||w||={np.linalg.norm(w_const_vec):.3f})")
+    print(f"  阵风模型: OU 过程 (θ={ou_theta}, σ={ou_sigma})")
+    print(f"  ESO 带宽: ω₀ = {omega_o} rad/s")
+    print(f"  ESO 增益: β₁ = {2*omega_o:.1f}, β₂ = {omega_o**2:.1f}")
+
+    # --- 场景1: 无扰动基线 (使用标准初始位置) ---
+    print("  运行场景1: 无扰动基线...")
+    wind_none = WindDisturbance(controller.n_f, dim=d, seed=wind_seed)
+    (times_eso_bl, pos_eso_bl, err_eso_bl,
+     ctrl_eso_bl, eso_data_bl) = simulate_first_order_eso(
+        controller, init_pos, leader_traj, (0, T_total), dt=dt,
+        wind=None, eso=None,
+    )
+    print(f"    最终误差: {err_eso_bl[-1]:.6f}")
+
+    # --- 场景2: 有扰动、无 ESO ---
+    print("  运行场景2: 有扰动、无 ESO...")
+    wind_noeso = WindDisturbance(
+        controller.n_f, dim=d, w_const=w_const_vec,
+        ou_theta=ou_theta, ou_sigma=ou_sigma, seed=wind_seed)
+    (times_eso_nd, pos_eso_nd, err_eso_nd,
+     ctrl_eso_nd, eso_data_nd) = simulate_first_order_eso(
+        controller, init_pos, leader_traj, (0, T_total), dt=dt,
+        wind=wind_noeso, eso=None,
+    )
+    print(f"    最终误差: {err_eso_nd[-1]:.6f}")
+
+    # --- 场景3: 有扰动、有 ESO ---
+    print("  运行场景3: 有扰动、有 ESO...")
+    wind_weso = WindDisturbance(
+        controller.n_f, dim=d, w_const=w_const_vec,
+        ou_theta=ou_theta, ou_sigma=ou_sigma, seed=wind_seed)
+    eso = ExtendedStateObserver(controller.n_f, dim=d, omega_o=omega_o)
+    (times_eso_wd, pos_eso_wd, err_eso_wd,
+     ctrl_eso_wd, eso_data_wd) = simulate_first_order_eso(
+        controller, init_pos, leader_traj, (0, T_total), dt=dt,
+        wind=wind_weso, eso=eso,
+    )
+    print(f"    最终误差: {err_eso_wd[-1]:.6f}")
+
+    # 稳态误差分析
+    # 理论稳态误差 (无ESO): δ_f = Ω_ff⁻¹ w_const / K_p
+    Omega_ff_inv = np.linalg.inv(controller.Omega_ff)
+    w_const_all = np.tile(w_const_vec, (controller.n_f, 1))
+    delta_theory = Omega_ff_inv @ w_const_all / controller.gain
+    delta_norm = np.linalg.norm(delta_theory)
+    print(f"\n  === ESO 抗扰效果 ===")
+    print(f"  理论稳态偏差 (无ESO, 恒定风): {delta_norm:.4f} m")
+    print(f"  实际稳态误差 (无扰动): {err_eso_bl[-1]:.6f}")
+    print(f"  实际稳态误差 (有扰动无ESO): {err_eso_nd[-1]:.6f}")
+    print(f"  实际稳态误差 (有扰动有ESO): {err_eso_wd[-1]:.6f}")
+    if err_eso_nd[-1] > 1e-6:
+        reduction = (1 - err_eso_wd[-1] / err_eso_nd[-1]) * 100
+        print(f"  误差降低: {reduction:.1f}%")
+
+    # ==== 图11: ESO 扰动估计精度 ====
+    fig11, axes11 = plt.subplots(2, 2, figsize=(16, 10))
+
+    # 选择一个代表性跟随者 (agent 1, 即 follower index 0)
+    fi_show = 0
+    fi_global = follower_indices[fi_show]
+    axis_labels = ['X', 'Y', 'Z']
+    axis_colors = ['#1f77b4', '#2ca02c', '#d62728']
+
+    # (a) 扰动真实值 vs ESO 估计（三个分量）
+    for k in range(d):
+        axes11[0, 0].plot(times_eso_wd,
+                          eso_data_wd['disturbances_true'][:, fi_show, k],
+                          color=axis_colors[k], linewidth=1.2, alpha=0.7,
+                          label=f'真实 w_{axis_labels[k]}')
+        axes11[0, 0].plot(times_eso_wd,
+                          eso_data_wd['disturbances_est'][:, fi_show, k],
+                          color=axis_colors[k], linewidth=1.2,
+                          linestyle='--', alpha=0.9,
+                          label=f'ESO z2_{axis_labels[k]}')
+    axes11[0, 0].set_xlabel('时间 (s)')
+    axes11[0, 0].set_ylabel('扰动 (m/s)')
+    axes11[0, 0].set_title(f'(a) Agent {fi_global} 扰动估计', fontsize=11)
+    axes11[0, 0].legend(fontsize=7, ncol=2)
+    axes11[0, 0].grid(True, alpha=0.3)
+    axes11[0, 0].set_xlim([0, T_total])
+
+    # (b) 所有跟随者的扰动估计误差范数
+    for i in range(controller.n_f):
+        fi_g = follower_indices[i]
+        est_err_i = np.linalg.norm(
+            eso_data_wd['disturbances_true'][:, i]
+            - eso_data_wd['disturbances_est'][:, i], axis=1)
+        axes11[0, 1].plot(times_eso_wd, est_err_i, linewidth=0.8,
+                          alpha=0.7, label=f'Agent {fi_g}')
+    axes11[0, 1].set_xlabel('时间 (s)')
+    axes11[0, 1].set_ylabel('||w - z2|| (m/s)')
+    axes11[0, 1].set_title('(b) 扰动估计误差', fontsize=11)
+    axes11[0, 1].legend(fontsize=8)
+    axes11[0, 1].grid(True, alpha=0.3)
+    axes11[0, 1].set_xlim([0, T_total])
+
+    # (c) 编队误差三场景对比
+    axes11[1, 0].semilogy(times_eso_bl, err_eso_bl + 1e-16, 'b-',
+                           linewidth=1.5, label='无扰动')
+    axes11[1, 0].semilogy(times_eso_nd, err_eso_nd + 1e-16, 'r-',
+                           linewidth=1.5, alpha=0.8,
+                           label='有扰动 无ESO')
+    axes11[1, 0].semilogy(times_eso_wd, err_eso_wd + 1e-16, 'g-',
+                           linewidth=1.5, label='有扰动 有ESO')
+    axes11[1, 0].set_xlabel('时间 (s)')
+    axes11[1, 0].set_ylabel('编队误差 ||p_f - p_f*||')
+    axes11[1, 0].set_title('(c) 编队误差收敛对比', fontsize=11)
+    axes11[1, 0].legend()
+    axes11[1, 0].grid(True, alpha=0.3)
+    axes11[1, 0].set_xlim([0, T_total])
+    for i in range(len(phase_labels)):
+        if i < len(phase_times) - 1:
+            axes11[1, 0].axvspan(phase_times[i], phase_times[i + 1],
+                                 alpha=0.1, color=colors[i % len(colors)])
+
+    # (d) 控制输入范数对比（有扰动: 无ESO vs 有ESO）
+    ctrl_norm_nd = np.linalg.norm(ctrl_eso_nd, axis=2).max(axis=1)
+    ctrl_norm_wd = np.linalg.norm(ctrl_eso_wd, axis=2).max(axis=1)
+    axes11[1, 1].plot(times_eso_nd, ctrl_norm_nd, 'r-', linewidth=1.0,
+                       alpha=0.7, label='无 ESO')
+    axes11[1, 1].plot(times_eso_wd, ctrl_norm_wd, 'g-', linewidth=1.0,
+                       alpha=0.7, label='有 ESO')
+    axes11[1, 1].axhline(y=u_max, color='gray', linestyle='--',
+                          linewidth=1.5, alpha=0.5, label=f'u_max={u_max}')
+    axes11[1, 1].set_xlabel('时间 (s)')
+    axes11[1, 1].set_ylabel('max ||u_i|| (m/s)')
+    axes11[1, 1].set_title('(d) 最大控制输入对比', fontsize=11)
+    axes11[1, 1].legend()
+    axes11[1, 1].grid(True, alpha=0.3)
+    axes11[1, 1].set_xlim([0, T_total])
+
+    fig11.suptitle(f'ESO 扰动估计与补偿效果 '
+                   f'(w0={omega_o}, w_const={w_const_vec}, '
+                   f'OU: theta={ou_theta}, sigma={ou_sigma})', fontsize=13)
+    fig11.tight_layout()
+    fig11.savefig('e:/crazyflie/src/fig11_eso_disturbance_rejection.png',
+                  dpi=200, bbox_inches='tight')
+    archive.save_figure(fig11, 'fig11_eso_disturbance_rejection')
+    print("  已保存: fig11_eso_disturbance_rejection.png")
+
+    # ==== 图12: 不同 ESO 带宽对比 ====
+    omega_values = [2.0, 5.0, 8.0, 15.0]
+    fig12, axes12 = plt.subplots(1, 2, figsize=(14, 5))
+
+    for wo in omega_values:
+        wind_cmp = WindDisturbance(
+            controller.n_f, dim=d, w_const=w_const_vec,
+            ou_theta=ou_theta, ou_sigma=ou_sigma, seed=wind_seed)
+        eso_cmp = ExtendedStateObserver(controller.n_f, dim=d, omega_o=wo)
+        (t_cmp, _, err_cmp, ctrl_cmp,
+         eso_data_cmp) = simulate_first_order_eso(
+            controller, init_pos, leader_traj, (0, T_total), dt=dt,
+            wind=wind_cmp, eso=eso_cmp,
+        )
+        axes12[0].semilogy(t_cmp, err_cmp + 1e-16, linewidth=1.5,
+                            label=f'w0={wo}')
+        # 稳态扰动估计误差（取最后 20% 时间平均）
+        n_tail = max(1, int(len(t_cmp) * 0.2))
+        mean_est_err = eso_data_cmp['estimation_errors'][-n_tail:].mean()
+        axes12[1].bar(f'w0={wo}', mean_est_err, alpha=0.7)
+
+    # 无 ESO 基线
+    axes12[0].semilogy(times_eso_nd, err_eso_nd + 1e-16, 'k--',
+                        linewidth=1.5, alpha=0.5, label='无 ESO')
+    axes12[0].set_xlabel('时间 (s)')
+    axes12[0].set_ylabel('编队误差 ||p_f - p_f*||')
+    axes12[0].set_title('(a) 不同 ESO 带宽下的误差收敛', fontsize=11)
+    axes12[0].legend()
+    axes12[0].grid(True, alpha=0.3)
+    axes12[0].set_xlim([0, T_total])
+
+    axes12[1].set_ylabel('稳态估计误差 ||w - z2||')
+    axes12[1].set_title('(b) 稳态扰动估计精度', fontsize=11)
+    axes12[1].grid(True, alpha=0.3, axis='y')
+
+    fig12.suptitle('ESO 带宽参数 w0 对抗扰性能的影响', fontsize=14)
+    fig12.tight_layout()
+    fig12.savefig('e:/crazyflie/src/fig12_eso_bandwidth_comparison.png',
+                  dpi=200, bbox_inches='tight')
+    archive.save_figure(fig12, 'fig12_eso_bandwidth_comparison')
+    print("  已保存: fig12_eso_bandwidth_comparison.png")
+
+    # ----------------------------------------------------------
     # Step 8: 验证仿射不变性
     # ----------------------------------------------------------
     print("\n[Step 8] 仿射不变性验证...")
@@ -1096,6 +1403,11 @@ def main():
         cbf_min_distances_wcbf=min_d_wcbf,
         cbf_modifications=cbf_data_wcbf['modifications'],
         cbf_n_active=cbf_data_wcbf['n_active'],
+        eso_errors_baseline=err_eso_bl,
+        eso_errors_no_eso=err_eso_nd,
+        eso_errors_with_eso=err_eso_wd,
+        eso_disturbances_true=eso_data_wd['disturbances_true'],
+        eso_disturbances_est=eso_data_wd['disturbances_est'],
     )
 
     # 保存应力矩阵与邻接矩阵
@@ -1153,6 +1465,19 @@ def main():
             'max_modification': float(cbf_data_wcbf['modifications'].max()),
             'final_error_nocbf': float(err_nocbf[-1]),
             'final_error_wcbf': float(err_wcbf[-1]),
+        },
+        'eso_disturbance_rejection': {
+            'omega_o': omega_o,
+            'beta1': 2 * omega_o,
+            'beta2': omega_o ** 2,
+            'w_const': w_const_vec.tolist(),
+            'ou_theta': ou_theta,
+            'ou_sigma': ou_sigma,
+            'wind_seed': wind_seed,
+            'theoretical_steady_error': float(delta_norm),
+            'final_error_baseline': float(err_eso_bl[-1]),
+            'final_error_no_eso': float(err_eso_nd[-1]),
+            'final_error_with_eso': float(err_eso_wd[-1]),
         },
         'stress_matrix_validation': results,
         'eigenvalues_omega': eigvals.tolist(),
