@@ -168,6 +168,45 @@ def grid_3d(nx=2, ny=2, nz=2, spacing=1.0):
     return positions, leader_indices, adj
 
 
+def aerial_pyramid_10(base_half=1.4, mid_radius=0.9,
+                                            base_height=0.9, mid_height=1.9,
+                                            top_height=2.8, apex_height=3.7):
+        """
+        10 智能体空中金字塔编队（3D）。
+
+        结构：
+            - 底层：4 个角点正方形
+            - 中层：4 个轴向支撑点
+            - 顶层：1 个中心平台点
+            - 尖顶：1 个 apex 点
+
+        Leader 选取: agents {0, 1, 2, 9}
+            使用 3 个底层角点 + 1 个尖顶，保证 4 个 leader 不共面。
+
+        Returns
+        -------
+        positions : ndarray (10, 3)
+        leader_indices : list[int]
+        adj : ndarray (10, 10)
+        """
+        positions = np.array([
+                [-base_half, -base_half, base_height],
+                [base_half, -base_half, base_height],
+                [base_half, base_half, base_height],
+                [-base_half, base_half, base_height],
+                [0.0, -mid_radius, mid_height],
+                [mid_radius, 0.0, mid_height],
+                [0.0, mid_radius, mid_height],
+                [-mid_radius, 0.0, mid_height],
+                [0.0, 0.0, top_height],
+                [0.0, 0.0, apex_height],
+        ], dtype=float)
+
+        leader_indices = [0, 1, 2, 9]
+        adj = np.ones((10, 10), dtype=int) - np.eye(10, dtype=int)
+        return positions, leader_indices, adj
+
+
 def custom_formation(positions, leader_indices, adj_matrix=None, connect_radius=None):
     """
     自定义编队构型。

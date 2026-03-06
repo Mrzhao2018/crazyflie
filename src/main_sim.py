@@ -14,11 +14,14 @@ main_sim.py - 仿射编队控制 (AFC) 完整仿真与可视化
 用法：
     在仓库根目录运行：
     python src/main_sim.py
+    python src/main_sim.py --scenario pyramid
 
     或者在 src 目录运行：
     python main_sim.py
 """
 
+import argparse
+import json
 import os
 
 import numpy as np
@@ -35,7 +38,7 @@ from stress_matrix import (compute_stress_matrix, validate_stress_matrix,
                            print_validation, compute_sparse_stress_matrix,
                            compute_power_centric_stress_matrix)
 from formation import (
-    double_pentagon, affine_transform, scale_matrix,
+    aerial_pyramid_10, double_pentagon, affine_transform, scale_matrix,
     rotation_matrix_z, create_leader_trajectory, graph_info, smoothstep,
     CRAZYFLIE_COMM, check_affine_span, build_power_centric_topology,
     select_leaders_for_direction, compute_dwell_time,
@@ -54,12 +57,53 @@ plt.rcParams['figure.dpi'] = 120
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 OUTPUT_DIR = os.path.join(ROOT_DIR, 'outputs')
 FIGURE_DIR = os.path.join(OUTPUT_DIR, 'figures')
+PYRAMID_CONFIG_PATH = os.path.join(ROOT_DIR, 'pyramid_mission_config.json')
 for _dir in (OUTPUT_DIR, FIGURE_DIR):
     os.makedirs(_dir, exist_ok=True)
 
 
+DEFAULT_PYRAMID_MISSION_CONFIG = {
+    'gain': 5.5,
+    'd_safe': 0.16,
+    'd_activate': 0.9,
+    'cbf_gamma': 6.0,
+    'total_time': 34.0,
+    'init_radius': 1.9,
+    'init_noise_std': 0.04,
+    'rng_seed': 2026,
+    'wind_const': [0.08, -0.03, 0.02],
+    'ou_theta': 0.4,
+    'ou_sigma': 0.04,
+    'wind_seed': 321,
+    'eso_omega': 8.0,
+    'et_mu': 0.015,
+    'et_varpi': 0.45,
+    'et_phi_0': 1.0,
+}
+
+
 def figure_path(name):
     return os.path.join(FIGURE_DIR, name)
+
+
+def load_pyramid_mission_config():
+    """加载综合金字塔任务默认参数，若无配置文件则回退到内置默认值。"""
+    config = DEFAULT_PYRAMID_MISSION_CONFIG.copy()
+    if os.path.exists(PYRAMID_CONFIG_PATH):
+        with open(PYRAMID_CONFIG_PATH, 'r', encoding='utf-8') as f:
+            loaded = json.load(f)
+        if isinstance(loaded, dict):
+            config.update(loaded)
+    return config
+
+
+def save_pyramid_mission_config(config):
+    """保存综合金字塔任务默认参数到独立配置文件。"""
+    merged = DEFAULT_PYRAMID_MISSION_CONFIG.copy()
+    merged.update(config)
+    with open(PYRAMID_CONFIG_PATH, 'w', encoding='utf-8') as f:
+        json.dump(merged, f, indent=2, ensure_ascii=False)
+    return PYRAMID_CONFIG_PATH
 
 
 # ============================================================
@@ -533,6 +577,251 @@ def simulate_second_order_et(controller, initial_positions,
     return times, positions_history, errors, control_inputs, et_data
 
 
+def simulate_integrated_first_order_rhf(controller, initial_positions,
+                                        nominal_pos, rhf_schedule, t_span,
+                                        dt=0.02, wind=None, eso_omega=8.0,
+                                        cbf_kwargs=None, et_kwargs=None):
+    """
+    综合场景仿真：一阶 AFC + 输入饱和 + CBF + ESO + ET + RHF。
+
+    说明：
+      - 采用一阶位置动力学，以保持 CBF 安全滤波的理论假设一致；
+      - 事件触发模块用于稀疏化邻居位置广播，控制律使用广播位置；
+      - RHF 在阶段切换时重构 leader 集合、拓扑和应力矩阵。
+    """
+    n = controller.n
+    d_dim = initial_positions.shape[1]
+
+    times = np.arange(t_span[0], t_span[1] + dt / 2, dt)
+    n_steps = len(times)
+
+    positions_history = np.zeros((n_steps, n, d_dim))
+    errors = np.zeros(n_steps)
+    control_inputs = np.zeros((n_steps, n, d_dim))
+    min_distances = np.zeros(n_steps)
+    cbf_modifications = np.zeros(n_steps)
+    n_active_constraints = np.zeros(n_steps, dtype=int)
+    disturbances_true = np.zeros((n_steps, n, d_dim))
+    disturbances_est = np.zeros((n_steps, n, d_dim))
+    phase_indices = np.zeros(n_steps, dtype=int)
+    phi_history = np.full((n_steps, n), np.nan)
+
+    positions = initial_positions.copy()
+    schedule = sorted(rhf_schedule, key=lambda item: item['t_switch'])
+
+    switch_log = []
+    leader_history = []
+    trigger_log = []
+    trigger_counts = np.zeros(n, dtype=int)
+    follower_active_steps = np.zeros(n, dtype=int)
+
+    current_phase = -1
+    prev_leader_targets = positions[controller.leader_indices].copy()
+    current_leader_targets = prev_leader_targets.copy()
+    transition_start = t_span[0]
+    transition_end = t_span[0]
+
+    cbf_kwargs = cbf_kwargs or {}
+    et_kwargs = et_kwargs or {}
+
+    if wind is not None:
+        wind.reset()
+
+    cbf_filter = CBFSafetyFilter(
+        n_agents=n,
+        leader_indices=controller.leader_indices,
+        d_safe=cbf_kwargs.get('d_safe', CRAZYFLIE_SAFETY['safety_distance_m']),
+        gamma=cbf_kwargs.get('gamma', CRAZYFLIE_SAFETY['cbf_gamma']),
+        d_activate=cbf_kwargs.get('d_activate', CRAZYFLIE_SAFETY['activate_distance_m']),
+    )
+    et_manager = EventTriggerManager(
+        n_agents=n,
+        d=d_dim,
+        follower_indices=controller.follower_indices,
+        leader_indices=controller.leader_indices,
+        Omega=controller.Omega,
+        mu=et_kwargs.get('mu', 0.01),
+        varpi=et_kwargs.get('varpi', 0.5),
+        phi_0=et_kwargs.get('phi_0', 1.0),
+    )
+    et_manager.reset(positions)
+    eso = ExtendedStateObserver(controller.n_f, dim=d_dim, omega_o=eso_omega)
+    eso.reset(positions[controller.follower_indices])
+    leader_history.append((t_span[0], controller.leader_indices.copy()))
+
+    def leader_velocity(t, p_start, p_end, t_start, t_end):
+        if t <= t_start or t >= t_end or t_end <= t_start:
+            return np.zeros_like(p_end)
+        x = (t - t_start) / (t_end - t_start)
+        alpha_dot = 6.0 * x * (1.0 - x) / (t_end - t_start)
+        return alpha_dot * (p_end - p_start)
+
+    for idx in range(n_steps):
+        t = times[idx]
+
+        while (current_phase + 1 < len(schedule)
+               and t >= schedule[current_phase + 1]['t_switch']):
+            current_phase += 1
+            sched = schedule[current_phase]
+            pre_error = errors[max(0, idx - 1)] if idx > 0 else 0.0
+            prev_follower_indices = controller.follower_indices.copy()
+            prev_eso = eso
+
+            prev_leader_targets = positions[sched['leader_indices']].copy()
+            switch_info = controller.update_omega(
+                sched['omega'], sched['leader_indices']
+            )
+            current_leader_targets = sched['leader_targets']
+            transition_start = sched['t_switch']
+            transition_end = sched['t_switch'] + sched.get('t_transition', 5.0)
+
+            cbf_filter = CBFSafetyFilter(
+                n_agents=n,
+                leader_indices=controller.leader_indices,
+                d_safe=cbf_kwargs.get('d_safe', CRAZYFLIE_SAFETY['safety_distance_m']),
+                gamma=cbf_kwargs.get('gamma', CRAZYFLIE_SAFETY['cbf_gamma']),
+                d_activate=cbf_kwargs.get('d_activate', CRAZYFLIE_SAFETY['activate_distance_m']),
+            )
+            et_manager = EventTriggerManager(
+                n_agents=n,
+                d=d_dim,
+                follower_indices=controller.follower_indices,
+                leader_indices=controller.leader_indices,
+                Omega=controller.Omega,
+                mu=et_kwargs.get('mu', 0.01),
+                varpi=et_kwargs.get('varpi', 0.5),
+                phi_0=et_kwargs.get('phi_0', 1.0),
+            )
+            et_manager.reset(positions)
+
+            eso = ExtendedStateObserver(controller.n_f, dim=d_dim, omega_o=eso_omega)
+            eso.reset(positions[controller.follower_indices])
+            prev_index_map = {fi: i_loc for i_loc, fi in enumerate(prev_follower_indices)}
+            for i_loc, fi in enumerate(controller.follower_indices):
+                old_loc = prev_index_map.get(fi)
+                if old_loc is not None:
+                    eso.z1[i_loc] = prev_eso.z1[old_loc]
+                    eso.z2[i_loc] = prev_eso.z2[old_loc]
+
+            switch_log.append({
+                't_switch': sched['t_switch'],
+                'label': sched.get('label', f'phase_{current_phase}'),
+                'switch_info': switch_info,
+                'pre_switch_error': pre_error,
+                'step_idx': idx,
+            })
+            leader_history.append((sched['t_switch'], controller.leader_indices.copy()))
+
+        if t <= transition_start:
+            p_l = prev_leader_targets.copy()
+        elif t >= transition_end:
+            p_l = current_leader_targets.copy()
+        else:
+            alpha = smoothstep(t, transition_start, transition_end)
+            p_l = (1.0 - alpha) * prev_leader_targets + alpha * current_leader_targets
+
+        l_idx = controller.leader_indices
+        f_idx = controller.follower_indices
+        positions[l_idx] = p_l
+        positions_history[idx] = positions.copy()
+        phase_indices[idx] = max(current_phase, 0)
+
+        follower_active_steps[f_idx] += 1
+        et_manager.update_leaders(p_l)
+        triggered, errors_sq = et_manager.check_and_trigger(t, positions)
+        for fi in triggered:
+            trigger_counts[fi] += 1
+            trigger_log.append((t, fi))
+        et_manager.update_phi(errors_sq, dt)
+        for i_loc, fi in enumerate(f_idx):
+            phi_history[idx, fi] = et_manager.phi[i_loc]
+
+        p_f = positions[f_idx]
+        p_f_hat = et_manager.p_hat[f_idx]
+        p_l_hat = et_manager.p_hat[l_idx]
+
+        u_nom = -controller.gain * (controller.Omega_ff @ p_f_hat + controller.Omega_fl @ p_l_hat)
+        diag_ff = np.diag(np.diag(controller.Omega_ff))
+        u_nom -= controller.gain * (diag_ff @ (p_f - p_f_hat))
+
+        if wind is not None:
+            w_full = wind.current()
+            w_f = w_full[f_idx]
+            disturbances_true[idx, f_idx] = w_f
+        else:
+            w_f = np.zeros((controller.n_f, d_dim))
+
+        w_hat = eso.disturbance_estimate()
+        disturbances_est[idx, f_idx] = w_hat
+        u_cmd = controller.saturate(u_nom - w_hat)
+
+        v_l = leader_velocity(t, prev_leader_targets, current_leader_targets,
+                              transition_start, transition_end)
+        u_safe, cbf_info = cbf_filter.filter(positions, u_cmd, v_l)
+        cbf_modifications[idx] = cbf_info['modification_norm']
+        n_active_constraints[idx] = cbf_info['n_constraints']
+        control_inputs[idx, f_idx] = u_safe
+
+        min_distances[idx], _ = CBFSafetyFilter.min_distance(positions)
+        p_f_star = controller.steady_state(p_l)
+        errors[idx] = np.linalg.norm(p_f - p_f_star)
+
+        if idx < n_steps - 1:
+            positions[f_idx] = p_f + dt * (u_safe + w_f)
+            if wind is not None:
+                wind.step(dt)
+            eso.update(positions[f_idx], u_safe, dt)
+
+    for log_entry in switch_log:
+        step = log_entry['step_idx']
+        recovery_threshold = max(0.35, log_entry['pre_switch_error'] * 1.25)
+        recovery_step = None
+        for s in range(step, min(step + int(40.0 / dt), n_steps)):
+            if errors[s] < recovery_threshold:
+                recovery_step = s
+                break
+        log_entry['recovery_time'] = (
+            (times[recovery_step] - log_entry['t_switch'])
+            if recovery_step is not None else float('inf')
+        )
+        log_entry['post_switch_peak_error'] = float(
+            errors[step:min(step + int(10.0 / dt), n_steps)].max()
+        )
+
+    per_agent_comm = np.zeros(n)
+    valid_agents = follower_active_steps > 0
+    per_agent_comm[valid_agents] = (
+        trigger_counts[valid_agents] / np.maximum(follower_active_steps[valid_agents], 1) * 100.0
+    )
+    mean_comm = float(per_agent_comm[valid_agents].mean()) if np.any(valid_agents) else 0.0
+
+    mission_data = {
+        'switch_log': switch_log,
+        'leader_history': leader_history,
+        'schedule': schedule,
+        'phase_indices': phase_indices,
+        'min_distances': min_distances,
+        'cbf_modifications': cbf_modifications,
+        'n_active_constraints': n_active_constraints,
+        'disturbances_true': disturbances_true,
+        'disturbances_est': disturbances_est,
+        'trigger_log': trigger_log,
+        'trigger_counts': trigger_counts,
+        'phi_history': phi_history,
+        'follower_active_steps': follower_active_steps,
+        'comm_rates': {
+            'per_agent': per_agent_comm,
+            'mean': mean_comm,
+            'total_triggers': int(trigger_counts.sum()),
+            'total_possible': int(follower_active_steps.sum()),
+        },
+        'estimation_error': np.linalg.norm(disturbances_true - disturbances_est, axis=(1, 2)),
+        'n_switches': len(switch_log),
+    }
+
+    return times, positions_history, errors, control_inputs, mission_data
+
+
 # ============================================================
 # 层级重组 (RHF) 仿真引擎
 # ============================================================
@@ -816,11 +1105,748 @@ def plot_error_convergence(ax, times, errors, title="编队误差收敛"):
     ax.set_xlim([times[0], times[-1]])
 
 
+def build_base_animation_setup():
+    """构建场景 1-4 共用的基础编队与 Leader 轨迹。"""
+    nominal_pos, leader_indices, adj = double_pentagon(radius=1.0, height=1.0)
+    follower_indices = sorted(set(range(10)) - set(leader_indices))
+
+    omega, _ = compute_stress_matrix(nominal_pos, adj, leader_indices, method='optimize')
+    controller = AFCController(
+        omega,
+        leader_indices,
+        gain=5.0,
+        u_max=CRAZYFLIE_COMM['max_velocity'],
+        saturation_type='smooth',
+    )
+
+    nominal_leaders = nominal_pos[leader_indices]
+    pos_scale = affine_transform(nominal_leaders, A=scale_matrix(3, 1.5))
+    pos_rotate = affine_transform(
+        nominal_leaders,
+        A=rotation_matrix_z(np.pi / 4) @ scale_matrix(3, 1.5),
+    )
+
+    t_settle, t_trans, t_hold = 8.0, 5.0, 8.0
+    phases = [
+        {'start_positions': nominal_leaders, 't_start': 0.0, 't_end': 0.1, 'positions': nominal_leaders.copy()},
+        {'t_start': t_settle, 't_end': t_settle + t_trans, 'positions': pos_scale},
+        {
+            't_start': t_settle + t_trans + t_hold,
+            't_end': t_settle + 2 * t_trans + t_hold,
+            'positions': pos_rotate,
+        },
+    ]
+    leader_traj = create_leader_trajectory(phases)
+    total = t_settle + 2 * t_trans + 2 * t_hold
+
+    np.random.seed(42)
+    init_pos = nominal_pos.copy()
+    init_pos[follower_indices] += np.random.randn(len(follower_indices), 3) * 0.5
+
+    return {
+        'nominal_pos': nominal_pos,
+        'leader_indices': leader_indices,
+        'follower_indices': follower_indices,
+        'adj': adj,
+        'controller': controller,
+        'leader_traj': leader_traj,
+        'init_pos': init_pos,
+        'T_total': total,
+        't_settle': t_settle,
+        't_trans': t_trans,
+        't_hold': t_hold,
+        'Omega': omega,
+    }
+
+
+def build_base_phase_specs(setup):
+    t_settle = setup['t_settle']
+    t_trans = setup['t_trans']
+    t_hold = setup['t_hold']
+    total = setup['T_total']
+    return [
+        (0.0, t_settle, '#FFCCCC', '编队建立'),
+        (t_settle, t_settle + t_trans, '#CCFFCC', '缩放变换'),
+        (t_settle + t_trans, t_settle + t_trans + t_hold, '#CCCCFF', '缩放保持'),
+        (t_settle + t_trans + t_hold, t_settle + 2 * t_trans + t_hold, '#FFFFCC', '旋转变换'),
+        (t_settle + 2 * t_trans + t_hold, total, '#FFCCFF', '旋转保持'),
+    ]
+
+
+def _compute_min_pair_history(pos_hist):
+    n_steps, n_agents, _ = pos_hist.shape
+    pair_idx = np.zeros((n_steps, 2), dtype=int)
+    pair_dist = np.zeros(n_steps)
+    for k in range(n_steps):
+        pos = pos_hist[k]
+        best_dist = float('inf')
+        best_pair = (0, 1)
+        for i in range(n_agents):
+            for j in range(i + 1, n_agents):
+                dist = float(np.linalg.norm(pos[i] - pos[j]))
+                if dist < best_dist:
+                    best_dist = dist
+                    best_pair = (i, j)
+        pair_dist[k] = best_dist
+        pair_idx[k] = best_pair
+    return pair_idx, pair_dist
+
+
+def _compute_cumulative_trigger_counts(times, trigger_log, follower_indices):
+    counts = np.zeros((len(times), len(follower_indices)), dtype=int)
+    mapping = {fi: idx for idx, fi in enumerate(follower_indices)}
+    sorted_log = sorted(trigger_log, key=lambda item: item[0])
+    cursor = 0
+    running = np.zeros(len(follower_indices), dtype=int)
+    for ti, t in enumerate(times):
+        while cursor < len(sorted_log) and sorted_log[cursor][0] <= t + 1e-12:
+            _, agent = sorted_log[cursor]
+            if agent in mapping:
+                running[mapping[agent]] += 1
+            cursor += 1
+        counts[ti] = running
+    return counts
+
+
+def _compute_total_trigger_curve(cumulative_counts):
+    if cumulative_counts.size == 0:
+        return np.zeros(1)
+    return cumulative_counts.sum(axis=1)
+
+
+def build_baseline_animation_scenario():
+    setup = build_base_animation_setup()
+    controller = setup['controller']
+    times, pos_hist, errors, ctrl_inputs = simulate_first_order(
+        controller,
+        setup['init_pos'],
+        setup['leader_traj'],
+        (0, setup['T_total']),
+        dt=0.02,
+    )
+    ctrl_norms = np.linalg.norm(ctrl_inputs, axis=2)
+    max_ctrl = ctrl_norms.max(axis=1)
+
+    u_raw = np.zeros_like(ctrl_inputs)
+    for idx, t in enumerate(times):
+        p_l = setup['leader_traj'](t)
+        p_f = pos_hist[idx, setup['follower_indices']]
+        u_raw[idx] = -controller.gain * (controller.Omega_ff @ p_f + controller.Omega_fl @ p_l)
+    raw_norms = np.linalg.norm(u_raw, axis=2)
+    sat_ratio = np.mean(raw_norms > (controller.u_max or 0.0) * 0.95, axis=1) * 100.0
+
+    return {
+        'kind': 'baseline',
+        'title': '场景1：基线 AFC（缩放 + 旋转）',
+        'output': 'afc_scene1_baseline',
+        'times': times,
+        'pos_hist': pos_hist,
+        'errors': errors,
+        'adj': setup['adj'],
+        'leader_indices': setup['leader_indices'],
+        'follower_indices': setup['follower_indices'],
+        'phase_specs': build_base_phase_specs(setup),
+        'extra': {
+            'ctrl_norms': ctrl_norms,
+            'max_ctrl': max_ctrl,
+            'sat_ratio': sat_ratio,
+            'u_max': controller.u_max,
+        },
+    }
+
+
+def build_cbf_animation_scenario():
+    setup = build_base_animation_setup()
+    d_safe = CRAZYFLIE_SAFETY['safety_distance_m']
+    cbf = CBFSafetyFilter(
+        n_agents=10,
+        leader_indices=setup['leader_indices'],
+        d_safe=d_safe,
+        gamma=CRAZYFLIE_SAFETY['cbf_gamma'],
+        d_activate=CRAZYFLIE_SAFETY['activate_distance_m'],
+    )
+
+    np.random.seed(99)
+    init_pos = setup['nominal_pos'].copy()
+    init_pos[setup['follower_indices']] += np.random.randn(len(setup['follower_indices']), 3) * 1.5
+
+    times_no, _, _, _, cbf_no = simulate_first_order_cbf(
+        setup['controller'], init_pos, setup['leader_traj'], (0, setup['T_total']), dt=0.02, cbf_filter=None
+    )
+    times_yes, pos_hist, errors, _, cbf_yes = simulate_first_order_cbf(
+        setup['controller'], init_pos, setup['leader_traj'], (0, setup['T_total']), dt=0.02, cbf_filter=cbf
+    )
+    pair_hist, pair_dist = _compute_min_pair_history(pos_hist)
+
+    return {
+        'kind': 'cbf',
+        'title': '场景2：CBF 碰撞避免',
+        'output': 'afc_scene2_cbf',
+        'times': times_yes,
+        'pos_hist': pos_hist,
+        'errors': errors,
+        'adj': setup['adj'],
+        'leader_indices': setup['leader_indices'],
+        'follower_indices': setup['follower_indices'],
+        'phase_specs': build_base_phase_specs(setup),
+        'extra': {
+            'd_safe': d_safe,
+            'min_dist_no': cbf_no['min_distances'],
+            'min_dist_yes': cbf_yes['min_distances'],
+            'n_active': cbf_yes['n_active'],
+            'modifications': cbf_yes['modifications'],
+            'times_no': times_no,
+            'closest_pair': pair_hist,
+            'closest_pair_dist': pair_dist,
+        },
+    }
+
+
+def build_eso_animation_scenario():
+    setup = build_base_animation_setup()
+    n_f = setup['controller'].n_f
+    w_const = np.array([0.2, 0.1, 0.05])
+    ou_theta = 0.5
+    ou_sigma = 0.1
+    wind_seed = 123
+    omega_o = 8.0
+
+    times_bl, _, err_bl, _, _ = simulate_first_order_eso(
+        setup['controller'], setup['init_pos'], setup['leader_traj'], (0, setup['T_total']), dt=0.02, wind=None, eso=None,
+    )
+    times_nd, _, err_nd, _, _ = simulate_first_order_eso(
+        setup['controller'], setup['init_pos'], setup['leader_traj'], (0, setup['T_total']), dt=0.02,
+        wind=WindDisturbance(n_f, dim=3, w_const=w_const, ou_theta=ou_theta, ou_sigma=ou_sigma, seed=wind_seed),
+        eso=None,
+    )
+    times_wd, pos_hist, errors, _, eso_data = simulate_first_order_eso(
+        setup['controller'], setup['init_pos'], setup['leader_traj'], (0, setup['T_total']), dt=0.02,
+        wind=WindDisturbance(n_f, dim=3, w_const=w_const, ou_theta=ou_theta, ou_sigma=ou_sigma, seed=wind_seed),
+        eso=ExtendedStateObserver(n_f, dim=3, omega_o=omega_o),
+    )
+
+    rep_idx = 0
+    disturbance_true_norm = np.linalg.norm(eso_data['disturbances_true'][:, rep_idx], axis=1)
+    disturbance_est_norm = np.linalg.norm(eso_data['disturbances_est'][:, rep_idx], axis=1)
+    per_agent_est_error = np.linalg.norm(eso_data['disturbances_true'] - eso_data['disturbances_est'], axis=2)
+
+    return {
+        'kind': 'eso',
+        'title': '场景3：ESO 鲁棒抗扰',
+        'output': 'afc_scene3_eso',
+        'times': times_wd,
+        'pos_hist': pos_hist,
+        'errors': errors,
+        'adj': setup['adj'],
+        'leader_indices': setup['leader_indices'],
+        'follower_indices': setup['follower_indices'],
+        'phase_specs': build_base_phase_specs(setup),
+        'extra': {
+            'err_bl': err_bl,
+            'err_nd': err_nd,
+            'times_bl': times_bl,
+            'times_nd': times_nd,
+            'disturbance_true_norm': disturbance_true_norm,
+            'disturbance_est_norm': disturbance_est_norm,
+            'estimation_errors': eso_data['estimation_errors'],
+            'per_agent_est_error': per_agent_est_error,
+            'omega_o': omega_o,
+            'w_const': w_const,
+            'rep_agent': setup['follower_indices'][rep_idx],
+        },
+    }
+
+
+def build_et_animation_scenario():
+    setup = build_base_animation_setup()
+    init_vel = np.zeros_like(setup['init_pos'])
+    et_mgr = EventTriggerManager(
+        n_agents=10,
+        d=3,
+        follower_indices=setup['follower_indices'],
+        leader_indices=setup['leader_indices'],
+        Omega=setup['Omega'],
+        mu=0.01,
+        varpi=0.5,
+        phi_0=1.0,
+    )
+    times, pos_hist, errors, _, et_data = simulate_second_order_et(
+        setup['controller'], setup['init_pos'], init_vel, setup['leader_traj'], (0, setup['T_total']), dt=0.02, et_manager=et_mgr,
+    )
+
+    cumulative_counts = _compute_cumulative_trigger_counts(times, et_data['trigger_log'], setup['follower_indices'])
+    total_triggers = _compute_total_trigger_curve(cumulative_counts)
+    continuous_baseline = np.arange(len(times), dtype=float) * len(setup['follower_indices'])
+
+    return {
+        'kind': 'et',
+        'title': f"场景4：事件触发通信（平均通信率 {et_data['comm_rates']['mean']:.1f}%）",
+        'output': 'afc_scene4_et',
+        'times': times,
+        'pos_hist': pos_hist,
+        'errors': errors,
+        'adj': setup['adj'],
+        'leader_indices': setup['leader_indices'],
+        'follower_indices': setup['follower_indices'],
+        'phase_specs': build_base_phase_specs(setup),
+        'extra': {
+            'trigger_log': et_data['trigger_log'],
+            'comm_rates': et_data['comm_rates'],
+            'cumulative_counts': cumulative_counts,
+            'total_triggers': total_triggers,
+            'continuous_baseline': continuous_baseline,
+        },
+    }
+
+
+def build_rhf_animation_scenario():
+    nominal_pos, _, _ = double_pentagon(radius=1.0, height=1.0)
+
+    leaders_p0 = [0, 1, 2, 5]
+    omega_p0, info_p0 = compute_power_centric_stress_matrix(nominal_pos, leaders_p0)
+
+    leaders_p1, _ = select_leaders_for_direction(nominal_pos, [0, 1, 0], n_leaders=4, d=3)
+    omega_p1, info_p1 = compute_power_centric_stress_matrix(nominal_pos, leaders_p1)
+
+    leaders_p2, _ = select_leaders_for_direction(nominal_pos, [-1, 0, 0], n_leaders=4, d=3)
+    omega_p2, info_p2 = compute_power_centric_stress_matrix(nominal_pos, leaders_p2)
+
+    targets_p0 = nominal_pos[leaders_p0] + np.array([0.5, 0.0, 0.0])
+    targets_p1 = nominal_pos[leaders_p1] + np.array([0.5, 1.0, 0.0])
+    targets_p2 = nominal_pos[leaders_p2] + np.array([-0.5, 1.0, 0.0])
+
+    schedule = [
+        {
+            't_switch': 0.0,
+            'leader_indices': leaders_p0,
+            'leader_targets': targets_p0,
+            't_transition': 3.0,
+            'omega': omega_p0,
+            'adj': info_p0['adj_matrix'],
+            'label': 'Phase 0: +X 平移',
+        },
+        {
+            't_switch': 35.0,
+            'leader_indices': leaders_p1,
+            'leader_targets': targets_p1,
+            't_transition': 3.0,
+            'omega': omega_p1,
+            'adj': info_p1['adj_matrix'],
+            'label': 'Phase 1: +Y 转弯',
+        },
+        {
+            't_switch': 70.0,
+            'leader_indices': leaders_p2,
+            'leader_targets': targets_p2,
+            't_transition': 3.0,
+            'omega': omega_p2,
+            'adj': info_p2['adj_matrix'],
+            'label': 'Phase 2: -X 转弯(U 形)',
+        },
+    ]
+    total = 105.0
+    phase_specs = [
+        (0.0, 35.0, '#D8EFF8', 'Phase 0: +X'),
+        (35.0, 70.0, '#FFE7CC', 'Phase 1: +Y'),
+        (70.0, total, '#DDF3E4', 'Phase 2: -X'),
+    ]
+
+    controller = AFCController(
+        omega_p0,
+        leaders_p0,
+        gain=10.0,
+        damping=1.0,
+        u_max=CRAZYFLIE_COMM['max_velocity'],
+        saturation_type='smooth',
+    )
+    np.random.seed(123)
+    init_pos = nominal_pos.copy() + np.random.randn(10, 3) * 0.1
+    init_vel = np.zeros((10, 3))
+
+    times, pos_hist, errors, _, rhf_data = simulate_rhf(
+        controller, init_pos, init_vel, nominal_pos, schedule, (0, total), dt=0.02
+    )
+
+    return {
+        'kind': 'rhf',
+        'title': '场景5：层级重组 RHF（U 形转弯）',
+        'output': 'afc_scene5_rhf',
+        'times': times,
+        'pos_hist': pos_hist,
+        'errors': errors,
+        'adj': info_p0['adj_matrix'],
+        'leader_indices': leaders_p0,
+        'follower_indices': sorted(set(range(10)) - set(leaders_p0)),
+        'phase_specs': phase_specs,
+        'extra': {
+            'schedule': schedule,
+            'switch_times': [item['t_switch'] for item in schedule],
+            'rhf_data': rhf_data,
+            'phase_colors': ['#1f77b4', '#ff7f0e', '#2ca02c'],
+            'nominal_pos': nominal_pos,
+        },
+    }
+
+
+def run_pyramid_integrated_mission(dt=0.02, archive=None, standalone_archive=False,
+                                   config=None, render_outputs=True,
+                                   verbose=True):
+    """运行综合金字塔任务，可独立调用，也可嵌入完整主流程。"""
+    base_config = load_pyramid_mission_config()
+    if config:
+        base_config.update(config)
+    config = base_config
+
+    if verbose:
+        print("\n[Step 7.9] 综合场景：地面起飞并形成空中金字塔...")
+
+    pyramid_nominal, _, _ = aerial_pyramid_10()
+    pyramid_phase_defs = [
+        {
+            't_switch': 0.0,
+            'leaders': [0, 1, 2, 9],
+            'A': scale_matrix(3, [0.75, 0.75, 0.35]),
+            'b': np.array([-1.2, 0.0, 0.15]),
+            't_transition': 8.0,
+            'label': 'Phase 0: 起飞展开',
+        },
+        {
+            't_switch': 10.0,
+            'leaders': [0, 2, 5, 9],
+            'A': np.eye(3),
+            'b': np.array([0.0, 0.0, 0.0]),
+            't_transition': 7.0,
+            'label': 'Phase 1: 金字塔成形',
+        },
+        {
+            't_switch': 22.0,
+            'leaders': [1, 3, 6, 9],
+            'A': rotation_matrix_z(np.pi / 10) @ scale_matrix(3, [1.08, 1.08, 1.0]),
+            'b': np.array([1.4, 0.6, 0.35]),
+            't_transition': 8.0,
+            'label': 'Phase 2: 空中巡航',
+        },
+    ]
+
+    pyramid_schedule = []
+    pyramid_phase_infos = []
+    for phase_def in pyramid_phase_defs:
+        span = check_affine_span(pyramid_nominal, phase_def['leaders'])
+        omega_phase, phase_info = compute_power_centric_stress_matrix(
+            pyramid_nominal, phase_def['leaders']
+        )
+        leader_targets = affine_transform(
+            pyramid_nominal[phase_def['leaders']],
+            A=phase_def['A'],
+            b=phase_def['b'],
+        )
+        pyramid_schedule.append({
+            't_switch': phase_def['t_switch'],
+            'leader_indices': phase_def['leaders'],
+            'leader_targets': leader_targets,
+            't_transition': phase_def['t_transition'],
+            'omega': omega_phase,
+            'adj': phase_info['adj_matrix'],
+            'label': phase_def['label'],
+        })
+        pyramid_phase_infos.append({
+            'label': phase_def['label'],
+            'leaders': phase_def['leaders'],
+            'span_valid': span['valid'],
+            'span_rank': span['rank'],
+            'min_eig_ff': phase_info['min_eig_ff'],
+            'n_edges': phase_info['n_edges'],
+        })
+
+    if verbose:
+        for item in pyramid_phase_infos:
+            print(f"  [{item['label']}] leaders={item['leaders']}, "
+                  f"rank={item['span_rank']}, valid={item['span_valid']}, "
+                  f"lambda_min={item['min_eig_ff']:.5f}, edges={item['n_edges']}")
+
+    pyramid_controller = AFCController(
+        pyramid_schedule[0]['omega'],
+        pyramid_schedule[0]['leader_indices'],
+        gain=config.get('gain', 5.5),
+        u_max=CRAZYFLIE_COMM['max_velocity'],
+        saturation_type='smooth',
+    )
+    pyramid_total_time = config.get('total_time', 34.0)
+    pyramid_d_safe = config.get('d_safe', 0.16)
+    pyramid_d_activate = config.get('d_activate', 0.9)
+    pyramid_cbf_gamma = config.get('cbf_gamma', 6.0)
+    ground_angles = np.linspace(0.0, 2.0 * np.pi, 10, endpoint=False)
+    init_radius = config.get('init_radius', 1.9)
+    pyramid_ground = np.column_stack([
+        init_radius * np.cos(ground_angles),
+        init_radius * np.sin(ground_angles),
+        np.zeros(10),
+    ])
+    rng = np.random.default_rng(config.get('rng_seed', 2026))
+    pyramid_init = pyramid_ground.copy()
+    pyramid_init[:, :2] += rng.normal(
+        scale=config.get('init_noise_std', 0.04), size=(10, 2)
+    )
+
+    wind_const = np.asarray(config.get('wind_const', [0.08, -0.03, 0.02]), dtype=float)
+    ou_theta = config.get('ou_theta', 0.4)
+    ou_sigma = config.get('ou_sigma', 0.04)
+    wind_seed = config.get('wind_seed', 321)
+
+    pyramid_wind = WindDisturbance(
+        n_agents=10,
+        dim=3,
+        w_const=wind_const,
+        ou_theta=ou_theta,
+        ou_sigma=ou_sigma,
+        seed=wind_seed,
+    )
+    eso_omega = config.get('eso_omega', 8.0)
+    et_mu = config.get('et_mu', 0.015)
+    et_varpi = config.get('et_varpi', 0.45)
+    et_phi_0 = config.get('et_phi_0', 1.0)
+    pyramid_times, pyramid_pos_hist, pyramid_errors, pyramid_ctrl, pyramid_data = (
+        simulate_integrated_first_order_rhf(
+            pyramid_controller,
+            pyramid_init,
+            pyramid_nominal,
+            pyramid_schedule,
+            (0.0, pyramid_total_time),
+            dt=dt,
+            wind=pyramid_wind,
+            eso_omega=eso_omega,
+            cbf_kwargs={
+                'd_safe': pyramid_d_safe,
+                'gamma': pyramid_cbf_gamma,
+                'd_activate': pyramid_d_activate,
+            },
+            et_kwargs={
+                'mu': et_mu,
+                'varpi': et_varpi,
+                'phi_0': et_phi_0,
+            },
+        )
+    )
+
+    pyramid_comm = pyramid_data['comm_rates']
+    cbf_active_ratio = float(100.0 * np.mean(pyramid_data['n_active_constraints'] > 0))
+    min_distance = float(pyramid_data['min_distances'].min())
+    final_error = float(pyramid_errors[-1])
+    final_est_error = float(pyramid_data['estimation_error'][-1])
+
+    if verbose:
+        print(f"  综合场景步数: {len(pyramid_times)}")
+        print(f"  最终误差: {final_error:.6f}")
+        print(f"  最小间距: {min_distance:.4f} m")
+        print(f"  平均通信率: {pyramid_comm['mean']:.2f}%")
+        print(f"  通信节省: {100.0 - pyramid_comm['mean']:.1f}%")
+        print(f"  CBF 激活占比: {cbf_active_ratio:.1f}%")
+        print(f"  ESO 最终估计误差: {final_est_error:.6f}")
+        print(f"  RHF 切换次数: {pyramid_data['n_switches']}")
+
+    if render_outputs:
+        fig19 = plt.figure(figsize=(18, 5))
+        snap_steps = [
+            0,
+            min(int(8.0 / dt), len(pyramid_times) - 1),
+            min(int(17.0 / dt), len(pyramid_times) - 1),
+            len(pyramid_times) - 1,
+        ]
+        snap_titles = [
+            '(a) 地面待命',
+            '(b) 起飞展开',
+            '(c) 金字塔成形',
+            '(d) 巡航保持',
+        ]
+        for subplot_idx, (step_idx, title) in enumerate(zip(snap_steps, snap_titles), start=1):
+            ax = fig19.add_subplot(1, 4, subplot_idx, projection='3d')
+            phase_idx = int(pyramid_data['phase_indices'][step_idx])
+            plot_formation_3d(
+                ax,
+                pyramid_pos_hist[step_idx],
+                pyramid_schedule[phase_idx]['leader_indices'],
+                pyramid_schedule[phase_idx]['adj'],
+                title=f'{title} t={pyramid_times[step_idx]:.1f}s',
+            )
+        fig19.suptitle('综合场景：从地面起飞到空中金字塔', fontsize=14, y=1.02)
+        fig19.tight_layout()
+        fig19.savefig(figure_path('fig19_pyramid_mission_snapshots.png'), dpi=200, bbox_inches='tight')
+        if archive is not None:
+            archive.save_figure(fig19, 'fig19_pyramid_mission_snapshots')
+        if verbose:
+            print("  已保存: fig19_pyramid_mission_snapshots.png")
+        plt.close(fig19)
+
+        fig20, axes20 = plt.subplots(2, 2, figsize=(16, 10))
+        phase_switches = [item['t_switch'] for item in pyramid_schedule]
+
+        axes20[0, 0].semilogy(pyramid_times, pyramid_errors + 1e-16, color='tab:blue', linewidth=1.6)
+        for idx_phase, t_start in enumerate(phase_switches):
+            t_end = pyramid_schedule[idx_phase + 1]['t_switch'] if idx_phase + 1 < len(pyramid_schedule) else pyramid_total_time
+            axes20[0, 0].axvspan(t_start, t_end, alpha=0.08, color=f'C{idx_phase}')
+            if idx_phase > 0:
+                axes20[0, 0].axvline(t_start, color=f'C{idx_phase}', linestyle='--', linewidth=1.2)
+        axes20[0, 0].set_xlabel('时间 (s)')
+        axes20[0, 0].set_ylabel('编队误差')
+        axes20[0, 0].set_title('(a) 综合场景误差收敛')
+        axes20[0, 0].grid(True, alpha=0.3)
+
+        axes20[0, 1].plot(pyramid_times, pyramid_data['min_distances'], color='tab:red', linewidth=1.5, label='最小间距')
+        axes20[0, 1].axhline(pyramid_d_safe, color='black', linestyle='--', linewidth=1.2, label='安全阈值')
+        ax20b = axes20[0, 1].twinx()
+        ax20b.plot(pyramid_times, pyramid_data['n_active_constraints'], color='tab:orange', linewidth=1.0, alpha=0.8, label='活跃约束数')
+        axes20[0, 1].set_xlabel('时间 (s)')
+        axes20[0, 1].set_ylabel('距离 (m)')
+        ax20b.set_ylabel('约束数')
+        axes20[0, 1].set_title('(b) CBF 安全间距与约束激活')
+        axes20[0, 1].grid(True, alpha=0.3)
+
+        cumulative_triggers = np.cumsum([
+            len([ev for ev in pyramid_data['trigger_log'] if abs(ev[0] - t) <= dt / 2])
+            for t in pyramid_times
+        ])
+        continuous_baseline = np.arange(len(pyramid_times)) * 6
+        axes20[1, 0].plot(pyramid_times, cumulative_triggers, color='tab:green', linewidth=1.5, label='事件触发累计')
+        axes20[1, 0].plot(pyramid_times, continuous_baseline, 'k--', linewidth=1.2, alpha=0.5, label='连续通信基线')
+        axes20[1, 0].set_xlabel('时间 (s)')
+        axes20[1, 0].set_ylabel('累计通信次数')
+        axes20[1, 0].set_title('(c) ET 通信节省')
+        axes20[1, 0].legend(fontsize=8)
+        axes20[1, 0].grid(True, alpha=0.3)
+
+        axes20[1, 1].plot(pyramid_times, pyramid_data['estimation_error'], color='tab:purple', linewidth=1.5, label='||w-z_hat||')
+        axes20[1, 1].plot(pyramid_times, pyramid_data['cbf_modifications'], color='tab:cyan', linewidth=1.2, label='||u_safe-u_nom||')
+        axes20[1, 1].set_xlabel('时间 (s)')
+        axes20[1, 1].set_ylabel('幅值')
+        axes20[1, 1].set_title('(d) ESO 估计与安全修正')
+        axes20[1, 1].legend(fontsize=8)
+        axes20[1, 1].grid(True, alpha=0.3)
+
+        fig20.suptitle('综合场景模块协同指标', fontsize=14)
+        fig20.tight_layout()
+        fig20.savefig(figure_path('fig20_pyramid_mission_metrics.png'), dpi=200, bbox_inches='tight')
+        if archive is not None:
+            archive.save_figure(fig20, 'fig20_pyramid_mission_metrics')
+        if verbose:
+            print("  已保存: fig20_pyramid_mission_metrics.png")
+        plt.close(fig20)
+
+        fig21 = plt.figure(figsize=(18, 5))
+        for subplot_idx, sched in enumerate(pyramid_schedule, start=1):
+            ax = fig21.add_subplot(1, len(pyramid_schedule), subplot_idx, projection='3d')
+            plot_formation_3d(
+                ax,
+                pyramid_nominal,
+                sched['leader_indices'],
+                sched['adj'],
+                title=sched['label'],
+            )
+        fig21.suptitle('综合场景 RHF 阶段拓扑', fontsize=14, y=1.02)
+        fig21.tight_layout()
+        fig21.savefig(figure_path('fig21_pyramid_rhf_topology.png'), dpi=200, bbox_inches='tight')
+        if archive is not None:
+            archive.save_figure(fig21, 'fig21_pyramid_rhf_topology')
+        if verbose:
+            print("  已保存: fig21_pyramid_rhf_topology.png")
+        plt.close(fig21)
+
+    mission_results = {
+        'times': pyramid_times,
+        'positions': pyramid_pos_hist,
+        'errors': pyramid_errors,
+        'control_inputs': pyramid_ctrl,
+        'data': pyramid_data,
+        'nominal': pyramid_nominal,
+        'schedule': pyramid_schedule,
+        'phase_info': pyramid_phase_infos,
+        'total_time': pyramid_total_time,
+        'd_safe': pyramid_d_safe,
+        'd_activate': pyramid_d_activate,
+        'cbf_gamma': pyramid_cbf_gamma,
+        'comm': pyramid_comm,
+        'summary': {
+            'final_error': final_error,
+            'min_distance': min_distance,
+            'mean_comm_rate_pct': pyramid_comm['mean'],
+            'comm_saving_pct': 100.0 - pyramid_comm['mean'],
+            'cbf_active_ratio_pct': cbf_active_ratio,
+            'final_estimation_error': final_est_error,
+            'n_switches': pyramid_data['n_switches'],
+        },
+        'config': {
+            'gain': pyramid_controller.gain,
+            'd_safe': pyramid_d_safe,
+            'd_activate': pyramid_d_activate,
+            'cbf_gamma': pyramid_cbf_gamma,
+            'total_time': pyramid_total_time,
+            'init_radius': init_radius,
+            'init_noise_std': config.get('init_noise_std', 0.04),
+            'rng_seed': config.get('rng_seed', 2026),
+            'wind_const': wind_const.tolist(),
+            'ou_theta': ou_theta,
+            'ou_sigma': ou_sigma,
+            'wind_seed': wind_seed,
+            'eso_omega': eso_omega,
+            'et_mu': et_mu,
+            'et_varpi': et_varpi,
+            'et_phi_0': et_phi_0,
+        },
+    }
+
+    if standalone_archive:
+        standalone_arch = archive if archive is not None else SimArchive(tag='pyramid_mission')
+        standalone_arch.save_arrays(
+            pyramid_times=pyramid_times,
+            pyramid_positions=pyramid_pos_hist,
+            pyramid_errors=pyramid_errors,
+            pyramid_control_inputs=pyramid_ctrl,
+            pyramid_min_distances=pyramid_data['min_distances'],
+            pyramid_cbf_modifications=pyramid_data['cbf_modifications'],
+            pyramid_active_constraints=pyramid_data['n_active_constraints'],
+            pyramid_disturbances_true=pyramid_data['disturbances_true'],
+            pyramid_disturbances_est=pyramid_data['disturbances_est'],
+            pyramid_phi_history=pyramid_data['phi_history'],
+        )
+        standalone_arch.save_params({
+            'pyramid_integrated_mission': {
+                'formation': 'aerial_pyramid_10',
+                'total_time': pyramid_total_time,
+                'dt': dt,
+                'phase_info': pyramid_phase_infos,
+                'initial_leaders': pyramid_schedule[0]['leader_indices'],
+                'd_safe': pyramid_d_safe,
+                'd_activate': pyramid_d_activate,
+                'cbf_gamma': pyramid_cbf_gamma,
+                'final_error': final_error,
+                'min_distance': min_distance,
+                'mean_comm_rate_pct': pyramid_comm['mean'],
+                'comm_saving_pct': 100.0 - pyramid_comm['mean'],
+                'total_triggers': pyramid_comm['total_triggers'],
+                'total_possible': pyramid_comm['total_possible'],
+                'cbf_active_ratio_pct': cbf_active_ratio,
+                'final_estimation_error': final_est_error,
+                'n_switches': pyramid_data['n_switches'],
+                'config': mission_results['config'],
+            },
+        })
+        standalone_arch.finalize()
+
+    return mission_results
+
+
 # ============================================================
 # 主仿真流程
 # ============================================================
 
-def main():
+def main(selected_scenario='all'):
+    if selected_scenario == 'pyramid':
+        print("=" * 60)
+        print("仿射编队控制 (AFC) 仿真 - 综合金字塔任务单独运行")
+        print("=" * 60)
+        run_pyramid_integrated_mission(dt=0.02, archive=SimArchive(tag='pyramid_mission'), standalone_archive=True)
+        print("\n仿真完成！")
+        return
+
     print("=" * 60)
     print("仿射编队控制 (AFC) 仿真 - 10 无人机双层正五边形编队")
     print("=" * 60)
@@ -1511,8 +2537,8 @@ def main():
 
     print(f"  恒定风场: {w_const_vec} m/s (||w||={np.linalg.norm(w_const_vec):.3f})")
     print(f"  阵风模型: OU 过程 (θ={ou_theta}, σ={ou_sigma})")
-    print(f"  ESO 带宽: ω₀ = {omega_o} rad/s")
-    print(f"  ESO 增益: β₁ = {2*omega_o:.1f}, β₂ = {omega_o**2:.1f}")
+    print(f"  ESO 带宽: w0 = {omega_o} rad/s")
+    print(f"  ESO 增益: beta1 = {2*omega_o:.1f}, beta2 = {omega_o**2:.1f}")
 
     # --- 场景1: 无扰动基线 (使用标准初始位置) ---
     print("  运行场景1: 无扰动基线...")
@@ -1705,7 +2731,7 @@ def main():
 
     print(f"  动力学模型: 二阶积分器 p̈_f = u_f")
     print(f"  增益: K_p = {gain}, K_d = {K_d}")
-    print(f"  ET 参数: μ = {et_mu}, ϖ = {et_varpi}, φ₀ = {et_phi_0}")
+    print(f"  ET 参数: mu = {et_mu}, varpi = {et_varpi}, phi0 = {et_phi_0}")
 
     # 初始速度为零
     init_vel = np.zeros_like(init_pos)
@@ -1853,14 +2879,16 @@ def main():
                           et_data_et['phi_history'][:, i_loc],
                           linewidth=1.2, label=f'Agent {fi}')
     axes14[1, 1].set_xlabel('时间 (s)')
-    axes14[1, 1].set_ylabel('φ_i(t)')
-    axes14[1, 1].set_title('(d) 自适应参数 φ_i 演化', fontsize=11)
+    axes14[1, 1].set_ylabel(r'$\phi_i(t)$')
+    axes14[1, 1].set_title(r'(d) 自适应参数 $\phi_i$ 演化', fontsize=11)
     axes14[1, 1].legend(fontsize=8)
     axes14[1, 1].grid(True, alpha=0.3)
     axes14[1, 1].set_xlim([0, T_total])
 
-    fig14.suptitle(f'自适应事件触发通信分析 '
-                   f'(μ={et_mu}, ϖ={et_varpi}, φ₀={et_phi_0})', fontsize=14)
+    fig14.suptitle(
+        rf'自适应事件触发通信分析 ($\mu$={et_mu}, $\varpi$={et_varpi}, $\phi_0$={et_phi_0})',
+        fontsize=14,
+    )
     fig14.tight_layout()
     fig14.savefig(figure_path('fig14_et_communication_analysis.png'),
                   dpi=200, bbox_inches='tight')
@@ -2166,6 +3194,23 @@ def main():
     controller.update_omega(Omega, leader_indices)
 
     # ----------------------------------------------------------
+    # Step 7.9: 综合场景 - 地面起飞并形成空中金字塔
+    # ----------------------------------------------------------
+    pyramid_results = run_pyramid_integrated_mission(dt=dt, archive=archive)
+    pyramid_times = pyramid_results['times']
+    pyramid_pos_hist = pyramid_results['positions']
+    pyramid_errors = pyramid_results['errors']
+    pyramid_ctrl = pyramid_results['control_inputs']
+    pyramid_data = pyramid_results['data']
+    pyramid_schedule = pyramid_results['schedule']
+    pyramid_phase_infos = pyramid_results['phase_info']
+    pyramid_total_time = pyramid_results['total_time']
+    pyramid_d_safe = pyramid_results['d_safe']
+    pyramid_d_activate = pyramid_results['d_activate']
+    pyramid_cbf_gamma = pyramid_results['cbf_gamma']
+    pyramid_comm = pyramid_results['comm']
+
+    # ----------------------------------------------------------
     # Step 8: 验证仿射不变性
     # ----------------------------------------------------------
     print("\n[Step 8] 仿射不变性验证...")
@@ -2239,6 +3284,16 @@ def main():
         et_errors_continuous=err_2nd_cont,
         et_errors_triggered=err_2nd_et,
         et_phi_history=et_data_et['phi_history'],
+        pyramid_times=pyramid_times,
+        pyramid_positions=pyramid_pos_hist,
+        pyramid_errors=pyramid_errors,
+        pyramid_control_inputs=pyramid_ctrl,
+        pyramid_min_distances=pyramid_data['min_distances'],
+        pyramid_cbf_modifications=pyramid_data['cbf_modifications'],
+        pyramid_active_constraints=pyramid_data['n_active_constraints'],
+        pyramid_disturbances_true=pyramid_data['disturbances_true'],
+        pyramid_disturbances_est=pyramid_data['disturbances_est'],
+        pyramid_phi_history=pyramid_data['phi_history'],
     )
 
     # 保存应力矩阵与邻接矩阵
@@ -2326,6 +3381,25 @@ def main():
             'final_error_et': float(err_2nd_et[-1]),
             'comm_saving_pct': 100 - comm['mean'],
         },
+        'pyramid_integrated_mission': {
+            'formation': 'aerial_pyramid_10',
+            'total_time': pyramid_total_time,
+            'dt': dt,
+            'phase_info': pyramid_phase_infos,
+            'initial_leaders': pyramid_schedule[0]['leader_indices'],
+            'd_safe': pyramid_d_safe,
+            'd_activate': pyramid_d_activate,
+            'cbf_gamma': pyramid_cbf_gamma,
+            'final_error': float(pyramid_errors[-1]),
+            'min_distance': float(pyramid_data['min_distances'].min()),
+            'mean_comm_rate_pct': pyramid_comm['mean'],
+            'comm_saving_pct': 100.0 - pyramid_comm['mean'],
+            'total_triggers': pyramid_comm['total_triggers'],
+            'total_possible': pyramid_comm['total_possible'],
+            'cbf_active_ratio_pct': float(100.0 * np.mean(pyramid_data['n_active_constraints'] > 0)),
+            'final_estimation_error': float(pyramid_data['estimation_error'][-1]),
+            'n_switches': pyramid_data['n_switches'],
+        },
     })
 
     archive.finalize()
@@ -2334,4 +3408,12 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    parser = argparse.ArgumentParser(description='AFC 主仿真脚本')
+    parser.add_argument(
+        '--scenario',
+        choices=['all', 'pyramid'],
+        default='all',
+        help='all: 完整主流程；pyramid: 仅运行综合金字塔任务',
+    )
+    args = parser.parse_args()
+    main(selected_scenario=args.scenario)

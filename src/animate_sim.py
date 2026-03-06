@@ -7,6 +7,7 @@ animate_sim.py - 仿射编队控制多场景动画系统
   3. ESO       : 强调风扰动、估计精度、补偿效果
   4. ET        : 强调事件触发时间线、通信节省、触发活跃度
   5. RHF       : 强调 Leader 重组、拓扑切换、误差瞬态
+    6. Mission   : 地面起飞到空中金字塔，综合 AFC/CBF/ESO/ET/RHF
 
 用法：
     在仓库根目录运行：
@@ -18,6 +19,7 @@ animate_sim.py - 仿射编队控制多场景动画系统
 """
 
 import argparse
+import importlib.util
 import os
 import shutil
 
@@ -30,28 +32,32 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.animation import FFMpegWriter, FuncAnimation, PillowWriter
 
-from stress_matrix import compute_power_centric_stress_matrix, compute_stress_matrix
-from formation import (
-    CRAZYFLIE_COMM,
-    affine_transform,
-    create_leader_trajectory,
-    double_pentagon,
-    rotation_matrix_z,
-    scale_matrix,
-    select_leaders_for_direction,
-)
-from afc_controller import AFCController
 from archive import SimArchive
-from collision_avoidance import CBFSafetyFilter, CRAZYFLIE_SAFETY
-from disturbance_observer import ExtendedStateObserver, WindDisturbance
-from event_trigger import EventTriggerManager
-from main_sim import (
-    simulate_first_order,
-    simulate_first_order_cbf,
-    simulate_first_order_eso,
-    simulate_rhf,
-    simulate_second_order_et,
-)
+
+
+def _load_main_sim_module():
+    script_path = os.path.join(os.path.dirname(__file__), 'main_sim.py')
+    spec = importlib.util.spec_from_file_location('_crazyflie_main_sim', script_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f'无法加载主仿真模块: {script_path}')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_main_sim = _load_main_sim_module()
+build_baseline_animation_scenario = _main_sim.build_baseline_animation_scenario
+build_cbf_animation_scenario = _main_sim.build_cbf_animation_scenario
+build_eso_animation_scenario = _main_sim.build_eso_animation_scenario
+build_et_animation_scenario = _main_sim.build_et_animation_scenario
+build_rhf_animation_scenario = _main_sim.build_rhf_animation_scenario
+run_pyramid_integrated_mission = _main_sim.run_pyramid_integrated_mission
+simulate_first_order = _main_sim.simulate_first_order
+simulate_first_order_cbf = _main_sim.simulate_first_order_cbf
+simulate_first_order_eso = _main_sim.simulate_first_order_eso
+simulate_integrated_first_order_rhf = _main_sim.simulate_integrated_first_order_rhf
+simulate_rhf = _main_sim.simulate_rhf
+simulate_second_order_et = _main_sim.simulate_second_order_et
 
 plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei', 'DejaVu Sans']
 plt.rcParams['axes.unicode_minus'] = False
@@ -119,21 +125,17 @@ SCENE_THEMES = {
         'aux': '#264653',
         'phase_colors': ['#1f77b4', '#ff7f0e', '#2ca02c'],
     },
+    'mission': {
+        'figure_face': '#f8faf4',
+        'panel_face': '#eef4e6',
+        'leader': '#9c6644',
+        'leader_edge': '#5b3a29',
+        'follower': '#52796f',
+        'accent': '#bc4749',
+        'aux': '#386641',
+        'phase_colors': ['#5e60ce', '#ff7f11', '#2a9d8f'],
+    },
 }
-
-
-def _base_phase_specs(setup):
-    t_settle = setup['t_settle']
-    t_trans = setup['t_trans']
-    t_hold = setup['t_hold']
-    total = setup['T_total']
-    return [
-        (0.0, t_settle, '#FFCCCC', '编队建立'),
-        (t_settle, t_settle + t_trans, '#CCFFCC', '缩放变换'),
-        (t_settle + t_trans, t_settle + t_trans + t_hold, '#CCCCFF', '缩放保持'),
-        (t_settle + t_trans + t_hold, t_settle + 2 * t_trans + t_hold, '#FFFFCC', '旋转变换'),
-        (t_settle + 2 * t_trans + t_hold, total, '#FFCCFF', '旋转保持'),
-    ]
 
 
 def _phase_name(t, phase_specs):
@@ -154,47 +156,6 @@ def _compute_bounds(pos_hist, frame_indices, margin=0.5):
     return x_min, x_max, y_min, y_max, z_min, z_max
 
 
-def _compute_min_pair_history(pos_hist):
-    n_steps, n_agents, _ = pos_hist.shape
-    pair_idx = np.zeros((n_steps, 2), dtype=int)
-    pair_dist = np.zeros(n_steps)
-    for k in range(n_steps):
-        pos = pos_hist[k]
-        best_dist = float('inf')
-        best_pair = (0, 1)
-        for i in range(n_agents):
-            for j in range(i + 1, n_agents):
-                dist = float(np.linalg.norm(pos[i] - pos[j]))
-                if dist < best_dist:
-                    best_dist = dist
-                    best_pair = (i, j)
-        pair_dist[k] = best_dist
-        pair_idx[k] = best_pair
-    return pair_idx, pair_dist
-
-
-def _compute_cumulative_trigger_counts(times, trigger_log, follower_indices):
-    counts = np.zeros((len(times), len(follower_indices)), dtype=int)
-    mapping = {fi: idx for idx, fi in enumerate(follower_indices)}
-    sorted_log = sorted(trigger_log, key=lambda item: item[0])
-    cursor = 0
-    running = np.zeros(len(follower_indices), dtype=int)
-    for ti, t in enumerate(times):
-        while cursor < len(sorted_log) and sorted_log[cursor][0] <= t + 1e-12:
-            _, agent = sorted_log[cursor]
-            if agent in mapping:
-                running[mapping[agent]] += 1
-            cursor += 1
-        counts[ti] = running
-    return counts
-
-
-def _compute_total_trigger_curve(cumulative_counts):
-    if cumulative_counts.size == 0:
-        return np.zeros(1)
-    return cumulative_counts.sum(axis=1)
-
-
 def _current_rhf_phase(schedule, t):
     phase_idx = 0
     for idx, item in enumerate(schedule):
@@ -205,343 +166,87 @@ def _current_rhf_phase(schedule, t):
     return phase_idx
 
 
-def _build_base_setup():
-    nominal_pos, leader_indices, adj = double_pentagon(radius=1.0, height=1.0)
-    follower_indices = sorted(set(range(10)) - set(leader_indices))
-
-    omega, _ = compute_stress_matrix(nominal_pos, adj, leader_indices, method='optimize')
-    controller = AFCController(
-        omega, leader_indices, gain=5.0, u_max=1.0, saturation_type='smooth'
-    )
-
-    nominal_leaders = nominal_pos[leader_indices]
-    pos_scale = affine_transform(nominal_leaders, A=scale_matrix(3, 1.5))
-    pos_rotate = affine_transform(
-        nominal_leaders,
-        A=rotation_matrix_z(np.pi / 4) @ scale_matrix(3, 1.5),
-    )
-
-    t_settle, t_trans, t_hold = 8.0, 5.0, 8.0
-    phases = [
-        {'start_positions': nominal_leaders, 't_start': 0.0, 't_end': 0.1, 'positions': nominal_leaders.copy()},
-        {'t_start': t_settle, 't_end': t_settle + t_trans, 'positions': pos_scale},
-        {
-            't_start': t_settle + t_trans + t_hold,
-            't_end': t_settle + 2 * t_trans + t_hold,
-            'positions': pos_rotate,
-        },
-    ]
-    leader_traj = create_leader_trajectory(phases)
-    total = t_settle + 2 * t_trans + 2 * t_hold
-
-    np.random.seed(42)
-    init_pos = nominal_pos.copy()
-    init_pos[follower_indices] += np.random.randn(len(follower_indices), 3) * 0.5
-
-    return {
-        'nominal_pos': nominal_pos,
-        'leader_indices': leader_indices,
-        'follower_indices': follower_indices,
-        'adj': adj,
-        'controller': controller,
-        'leader_traj': leader_traj,
-        'init_pos': init_pos,
-        'T_total': total,
-        't_settle': t_settle,
-        't_trans': t_trans,
-        't_hold': t_hold,
-        'Omega': omega,
-    }
-
-
-def run_baseline_scenario(setup):
-    controller = setup['controller']
-    times, pos_hist, errors, ctrl_inputs = simulate_first_order(
-        controller,
-        setup['init_pos'],
-        setup['leader_traj'],
-        (0, setup['T_total']),
-        dt=0.02,
-    )
-    ctrl_norms = np.linalg.norm(ctrl_inputs, axis=2)
-    max_ctrl = ctrl_norms.max(axis=1)
-
-    u_raw = np.zeros_like(ctrl_inputs)
+def _cumulative_event_curve(times, trigger_log, tolerance=1e-12):
+    counts = np.zeros(len(times), dtype=float)
+    cursor = 0
+    sorted_log = sorted(trigger_log, key=lambda item: item[0])
+    running = 0
     for idx, t in enumerate(times):
-        p_l = setup['leader_traj'](t)
-        p_f = pos_hist[idx, setup['follower_indices']]
-        u_raw[idx] = -controller.gain * (controller.Omega_ff @ p_f + controller.Omega_fl @ p_l)
-    raw_norms = np.linalg.norm(u_raw, axis=2)
-    sat_ratio = np.mean(raw_norms > (controller.u_max or 0.0) * 0.95, axis=1) * 100.0
-
-    return {
-        'kind': 'baseline',
-        'title': '场景1：基线 AFC（缩放 + 旋转）',
-        'output': 'afc_scene1_baseline',
-        'times': times,
-        'pos_hist': pos_hist,
-        'errors': errors,
-        'adj': setup['adj'],
-        'leader_indices': setup['leader_indices'],
-        'follower_indices': setup['follower_indices'],
-        'phase_specs': _base_phase_specs(setup),
-        'extra': {
-            'ctrl_norms': ctrl_norms,
-            'max_ctrl': max_ctrl,
-            'sat_ratio': sat_ratio,
-            'u_max': controller.u_max,
-        },
-    }
+        while cursor < len(sorted_log) and sorted_log[cursor][0] <= t + tolerance:
+            running += 1
+            cursor += 1
+        counts[idx] = running
+    return counts
 
 
-def run_cbf_scenario(setup):
-    d_safe = CRAZYFLIE_SAFETY['safety_distance_m']
-    cbf = CBFSafetyFilter(
-        n_agents=10,
-        leader_indices=setup['leader_indices'],
-        d_safe=d_safe,
-        gamma=CRAZYFLIE_SAFETY['cbf_gamma'],
-        d_activate=CRAZYFLIE_SAFETY['activate_distance_m'],
-    )
-
-    np.random.seed(99)
-    init_pos = setup['nominal_pos'].copy()
-    init_pos[setup['follower_indices']] += np.random.randn(len(setup['follower_indices']), 3) * 1.5
-
-    times_no, _, _, _, cbf_no = simulate_first_order_cbf(
-        setup['controller'], init_pos, setup['leader_traj'], (0, setup['T_total']), dt=0.02, cbf_filter=None
-    )
-    times_yes, pos_hist, errors, _, cbf_yes = simulate_first_order_cbf(
-        setup['controller'], init_pos, setup['leader_traj'], (0, setup['T_total']), dt=0.02, cbf_filter=cbf
-    )
-    pair_hist, pair_dist = _compute_min_pair_history(pos_hist)
-
-    return {
-        'kind': 'cbf',
-        'title': '场景2：CBF 碰撞避免',
-        'output': 'afc_scene2_cbf',
-        'times': times_yes,
-        'pos_hist': pos_hist,
-        'errors': errors,
-        'adj': setup['adj'],
-        'leader_indices': setup['leader_indices'],
-        'follower_indices': setup['follower_indices'],
-        'phase_specs': _base_phase_specs(setup),
-        'extra': {
-            'd_safe': d_safe,
-            'min_dist_no': cbf_no['min_distances'],
-            'min_dist_yes': cbf_yes['min_distances'],
-            'n_active': cbf_yes['n_active'],
-            'modifications': cbf_yes['modifications'],
-            'times_no': times_no,
-            'closest_pair': pair_hist,
-            'closest_pair_dist': pair_dist,
-        },
-    }
+def run_baseline_scenario():
+    return build_baseline_animation_scenario()
 
 
-def run_eso_scenario(setup):
-    n_f = setup['controller'].n_f
-    w_const = np.array([0.2, 0.1, 0.05])
-    ou_theta = 0.5
-    ou_sigma = 0.1
-    wind_seed = 123
-    omega_o = 8.0
-
-    times_bl, _, err_bl, _, _ = simulate_first_order_eso(
-        setup['controller'],
-        setup['init_pos'],
-        setup['leader_traj'],
-        (0, setup['T_total']),
-        dt=0.02,
-        wind=None,
-        eso=None,
-    )
-    times_nd, _, err_nd, _, _ = simulate_first_order_eso(
-        setup['controller'],
-        setup['init_pos'],
-        setup['leader_traj'],
-        (0, setup['T_total']),
-        dt=0.02,
-        wind=WindDisturbance(n_f, dim=3, w_const=w_const, ou_theta=ou_theta, ou_sigma=ou_sigma, seed=wind_seed),
-        eso=None,
-    )
-    times_wd, pos_hist, errors, _, eso_data = simulate_first_order_eso(
-        setup['controller'],
-        setup['init_pos'],
-        setup['leader_traj'],
-        (0, setup['T_total']),
-        dt=0.02,
-        wind=WindDisturbance(n_f, dim=3, w_const=w_const, ou_theta=ou_theta, ou_sigma=ou_sigma, seed=wind_seed),
-        eso=ExtendedStateObserver(n_f, dim=3, omega_o=omega_o),
-    )
-
-    rep_idx = 0
-    disturbance_true_norm = np.linalg.norm(eso_data['disturbances_true'][:, rep_idx], axis=1)
-    disturbance_est_norm = np.linalg.norm(eso_data['disturbances_est'][:, rep_idx], axis=1)
-    per_agent_est_error = np.linalg.norm(
-        eso_data['disturbances_true'] - eso_data['disturbances_est'], axis=2
-    )
-
-    return {
-        'kind': 'eso',
-        'title': '场景3：ESO 鲁棒抗扰',
-        'output': 'afc_scene3_eso',
-        'times': times_wd,
-        'pos_hist': pos_hist,
-        'errors': errors,
-        'adj': setup['adj'],
-        'leader_indices': setup['leader_indices'],
-        'follower_indices': setup['follower_indices'],
-        'phase_specs': _base_phase_specs(setup),
-        'extra': {
-            'err_bl': err_bl,
-            'err_nd': err_nd,
-            'times_bl': times_bl,
-            'times_nd': times_nd,
-            'disturbance_true_norm': disturbance_true_norm,
-            'disturbance_est_norm': disturbance_est_norm,
-            'estimation_errors': eso_data['estimation_errors'],
-            'per_agent_est_error': per_agent_est_error,
-            'omega_o': omega_o,
-            'w_const': w_const,
-            'rep_agent': setup['follower_indices'][rep_idx],
-        },
-    }
+def run_cbf_scenario():
+    return build_cbf_animation_scenario()
 
 
-def run_et_scenario(setup):
-    init_vel = np.zeros_like(setup['init_pos'])
-    et_mgr = EventTriggerManager(
-        n_agents=10,
-        d=3,
-        follower_indices=setup['follower_indices'],
-        leader_indices=setup['leader_indices'],
-        Omega=setup['Omega'],
-        mu=0.01,
-        varpi=0.5,
-        phi_0=1.0,
-    )
-    times, pos_hist, errors, _, et_data = simulate_second_order_et(
-        setup['controller'],
-        setup['init_pos'],
-        init_vel,
-        setup['leader_traj'],
-        (0, setup['T_total']),
-        dt=0.02,
-        et_manager=et_mgr,
-    )
+def run_eso_scenario():
+    return build_eso_animation_scenario()
 
-    cumulative_counts = _compute_cumulative_trigger_counts(times, et_data['trigger_log'], setup['follower_indices'])
-    total_triggers = _compute_total_trigger_curve(cumulative_counts)
-    continuous_baseline = np.arange(len(times), dtype=float) * len(setup['follower_indices'])
 
-    return {
-        'kind': 'et',
-        'title': f"场景4：事件触发通信（平均通信率 {et_data['comm_rates']['mean']:.1f}%）",
-        'output': 'afc_scene4_et',
-        'times': times,
-        'pos_hist': pos_hist,
-        'errors': errors,
-        'adj': setup['adj'],
-        'leader_indices': setup['leader_indices'],
-        'follower_indices': setup['follower_indices'],
-        'phase_specs': _base_phase_specs(setup),
-        'extra': {
-            'trigger_log': et_data['trigger_log'],
-            'comm_rates': et_data['comm_rates'],
-            'cumulative_counts': cumulative_counts,
-            'total_triggers': total_triggers,
-            'continuous_baseline': continuous_baseline,
-        },
-    }
+def run_et_scenario():
+    return build_et_animation_scenario()
 
 
 def run_rhf_scenario():
-    nominal_pos, _, _ = double_pentagon(radius=1.0, height=1.0)
+    return build_rhf_animation_scenario()
 
-    leaders_p0 = [0, 1, 2, 5]
-    omega_p0, info_p0 = compute_power_centric_stress_matrix(nominal_pos, leaders_p0)
 
-    leaders_p1, _ = select_leaders_for_direction(nominal_pos, [0, 1, 0], n_leaders=4, d=3)
-    omega_p1, info_p1 = compute_power_centric_stress_matrix(nominal_pos, leaders_p1)
+def run_mission_pyramid_scenario():
+    mission = run_pyramid_integrated_mission(
+        dt=0.02,
+        render_outputs=False,
+        verbose=False,
+    )
+    nominal_pos = mission['nominal']
+    schedule = mission['schedule']
+    times = mission['times']
+    pos_hist = mission['positions']
+    errors = mission['errors']
+    mission_data = mission['data']
+    d_safe = mission['d_safe']
+    total = mission['total_time']
 
-    leaders_p2, _ = select_leaders_for_direction(nominal_pos, [-1, 0, 0], n_leaders=4, d=3)
-    omega_p2, info_p2 = compute_power_centric_stress_matrix(nominal_pos, leaders_p2)
-
-    targets_p0 = nominal_pos[leaders_p0] + np.array([0.5, 0.0, 0.0])
-    targets_p1 = nominal_pos[leaders_p1] + np.array([0.5, 1.0, 0.0])
-    targets_p2 = nominal_pos[leaders_p2] + np.array([-0.5, 1.0, 0.0])
-
-    schedule = [
-        {
-            't_switch': 0.0,
-            'leader_indices': leaders_p0,
-            'leader_targets': targets_p0,
-            't_transition': 3.0,
-            'omega': omega_p0,
-            'adj': info_p0['adj_matrix'],
-            'label': 'Phase 0: +X 平移',
-        },
-        {
-            't_switch': 35.0,
-            'leader_indices': leaders_p1,
-            'leader_targets': targets_p1,
-            't_transition': 3.0,
-            'omega': omega_p1,
-            'adj': info_p1['adj_matrix'],
-            'label': 'Phase 1: +Y 转弯',
-        },
-        {
-            't_switch': 70.0,
-            'leader_indices': leaders_p2,
-            'leader_targets': targets_p2,
-            't_transition': 3.0,
-            'omega': omega_p2,
-            'adj': info_p2['adj_matrix'],
-            'label': 'Phase 2: -X 转弯(U 形)',
-        },
-    ]
-    total = 105.0
     phase_specs = [
-        (0.0, 35.0, '#D8EFF8', 'Phase 0: +X'),
-        (35.0, 70.0, '#FFE7CC', 'Phase 1: +Y'),
-        (70.0, total, '#DDF3E4', 'Phase 2: -X'),
+        (0.0, 10.0, '#DDE7F7', '起飞展开'),
+        (10.0, 22.0, '#FFE8CC', '金字塔成形'),
+        (22.0, total, '#DDF3E4', '空中巡航'),
     ]
-
-    controller = AFCController(
-        omega_p0,
-        leaders_p0,
-        gain=10.0,
-        damping=1.0,
-        u_max=CRAZYFLIE_COMM['max_velocity'],
-        saturation_type='smooth',
-    )
-    np.random.seed(123)
-    init_pos = nominal_pos.copy() + np.random.randn(10, 3) * 0.1
-    init_vel = np.zeros((10, 3))
-
-    times, pos_hist, errors, _, rhf_data = simulate_rhf(
-        controller, init_pos, init_vel, nominal_pos, schedule, (0, total), dt=0.02
-    )
+    total_triggers_curve = _cumulative_event_curve(times, mission_data['trigger_log'])
 
     return {
-        'kind': 'rhf',
-        'title': '场景5：层级重组 RHF（U 形转弯）',
-        'output': 'afc_scene5_rhf',
+        'kind': 'mission',
+        'title': '场景6：地面起飞到空中金字塔',
+        'output': 'afc_scene6_pyramid_mission',
         'times': times,
         'pos_hist': pos_hist,
         'errors': errors,
-        'adj': info_p0['adj_matrix'],
-        'leader_indices': leaders_p0,
-        'follower_indices': sorted(set(range(10)) - set(leaders_p0)),
+        'adj': schedule[0]['adj'],
+        'leader_indices': schedule[0]['leader_indices'],
+        'follower_indices': sorted(set(range(10)) - set(schedule[0]['leader_indices'])),
         'phase_specs': phase_specs,
         'extra': {
             'schedule': schedule,
             'switch_times': [item['t_switch'] for item in schedule],
-            'rhf_data': rhf_data,
-            'phase_colors': SCENE_THEMES['rhf']['phase_colors'],
+            'phase_colors': SCENE_THEMES['mission']['phase_colors'],
             'nominal_pos': nominal_pos,
+            'min_distances': mission_data['min_distances'],
+            'n_active': mission_data['n_active_constraints'],
+            'cbf_modifications': mission_data['cbf_modifications'],
+            'd_safe': d_safe,
+            'trigger_log': mission_data['trigger_log'],
+            'comm_rates': mission_data['comm_rates'],
+            'total_triggers_curve': total_triggers_curve,
+            'continuous_baseline': np.arange(len(times), dtype=float) * 6,
+            'estimation_error': mission_data['estimation_error'],
+            'phase_indices': mission_data['phase_indices'],
         },
     }
 
@@ -613,7 +318,7 @@ def _save_animation(scenario):
     follower_scatter = ax3d.scatter([], [], [], c=theme['follower'], s=70, marker='o',  # type: ignore[arg-type]
                                     edgecolors='white', linewidths=0.35, zorder=9)
 
-    if kind == 'rhf':
+    if kind in ('rhf', 'mission'):
         phase_colors = extra['phase_colors']
         phase_seg_lines = []
         for _ in range(n_agents):
@@ -754,6 +459,32 @@ def _save_animation(scenario):
         ax_b.set_ylabel('Y')
         ax_b.set_aspect('equal')
 
+    elif kind == 'mission':
+        _style_axes(ax_a, theme, '安全距离 / CBF 激活')
+        _style_axes(ax_b, theme, '通信累计 / ESO 误差')
+        ax_a.plot(times, extra['min_distances'], color=theme['accent'], linewidth=1.8, label='d_min')
+        ax_a.axhline(extra['d_safe'], color=theme['leader'], linestyle='--', linewidth=1.3, label='d_safe')
+        ax_a.fill_between(times, 0.0, extra['d_safe'], color='#f28482', alpha=0.10)
+        ax_a_right = ax_a.twinx()
+        ax_a_right.plot(times, extra['n_active'], color=theme['aux'], linewidth=1.2, label='n_active')
+        ax_a.set_xlim(0.0, times[-1])
+        ax_a.set_ylabel('m')
+        ax_a_right.set_ylabel('约束数')
+        ax_a.legend(fontsize=8, loc='lower right')
+
+        ax_b.plot(times, extra['total_triggers_curve'], color=theme['aux'], linewidth=1.7, label='事件触发累计')
+        ax_b.plot(times, extra['continuous_baseline'], color='#7a7a7a', linewidth=1.1, linestyle='--', label='连续通信基线')
+        ax_b_right = ax_b.twinx()
+        ax_b_right.plot(times, extra['estimation_error'], color=theme['leader'], linewidth=1.3, label='ESO 估计误差')
+        ax_b.set_xlim(0.0, times[-1])
+        ax_b.set_ylabel('累计发送次数')
+        ax_b_right.set_ylabel('误差')
+        ax_b.legend(fontsize=8, loc='upper left')
+        aux_current['a'] = ax_a.axvline(0.0, color=theme['accent'], linestyle='--', linewidth=1.0)
+        aux_current['a_right'] = ax_a_right.axvline(0.0, color=theme['leader'], linestyle=':', linewidth=1.0)
+        aux_current['b'] = ax_b.axvline(0.0, color=theme['accent'], linestyle='--', linewidth=1.0)
+        aux_current['b_right'] = ax_b_right.axvline(0.0, color=theme['leader'], linestyle=':', linewidth=1.0)
+
     else:
         raise ValueError(f'未知场景类型: {kind}')
 
@@ -847,6 +578,32 @@ def _save_animation(scenario):
             extra_lines.append(sched['label'])
             extra_lines.append(f"leaders: {sched['leader_indices']}")
 
+        elif kind == 'mission':
+            aux_current['a'].set_xdata([t, t])
+            aux_current['a_right'].set_xdata([t, t])
+            aux_current['b'].set_xdata([t, t])
+            aux_current['b_right'].set_xdata([t, t])
+            recent = {ev[1] for ev in extra['trigger_log'] if 0.0 <= t - ev[0] <= 0.8}
+            trigger_colors = []
+            trigger_sizes = []
+            for follower in current_followers:
+                if follower in recent:
+                    trigger_colors.append(theme['accent'])
+                    trigger_sizes.append(115.0)
+                else:
+                    trigger_colors.append(theme['follower'])
+                    trigger_sizes.append(70.0)
+            if len(trigger_colors) > 0:
+                follower_scatter.set_facecolors(trigger_colors)  # type: ignore[attr-defined]
+                follower_scatter.set_sizes(np.asarray(trigger_sizes))
+            phase_idx = _current_rhf_phase(extra['schedule'], t)
+            sched = extra['schedule'][phase_idx]
+            extra_lines.append(sched['label'])
+            extra_lines.append(f"d_min: {extra['min_distances'][fi]:.3f} m")
+            extra_lines.append(f"CBF active: {int(extra['n_active'][fi])}")
+            extra_lines.append(f"comm save: {100.0 - extra['comm_rates']['mean']:.1f}%")
+            extra_lines.append(f"ESO err: {extra['estimation_error'][fi]:.3f}")
+
         return extra_lines
 
     def init():
@@ -864,7 +621,7 @@ def _save_animation(scenario):
         t = times[fi]
         pos = pos_hist[fi]
 
-        if kind == 'rhf':
+        if kind in ('rhf', 'mission'):
             phase_idx = _current_rhf_phase(extra['schedule'], t)
             current_adj = extra['schedule'][phase_idx]['adj']
             current_leaders = extra['schedule'][phase_idx]['leader_indices']
@@ -896,7 +653,7 @@ def _save_animation(scenario):
                     )
                     edge_lines.append(line)
 
-        if kind == 'rhf' and phase_seg_lines is not None:
+        if kind in ('rhf', 'mission') and phase_seg_lines is not None:
             for agent in range(n_agents):
                 for p_idx, sched in enumerate(extra['schedule']):
                     t_start = sched['t_switch']
@@ -985,18 +742,16 @@ def _save_animation(scenario):
 
 def main():
     parser = argparse.ArgumentParser(description='AFC 多场景动画系统')
-    parser.add_argument('--scenario', type=int, default=0, help='场景编号 1-5，0 表示全部生成')
+    parser.add_argument('--scenario', type=int, default=0, help='场景编号 1-6，0 表示全部生成')
     args = parser.parse_args()
 
-    print('初始化基础仿真参数...')
-    setup = _build_base_setup()
-
     runners = {
-        1: lambda: run_baseline_scenario(setup),
-        2: lambda: run_cbf_scenario(setup),
-        3: lambda: run_eso_scenario(setup),
-        4: lambda: run_et_scenario(setup),
+        1: run_baseline_scenario,
+        2: run_cbf_scenario,
+        3: run_eso_scenario,
+        4: run_et_scenario,
         5: run_rhf_scenario,
+        6: run_mission_pyramid_scenario,
     }
 
     targets = list(runners.keys()) if args.scenario == 0 else [args.scenario]
