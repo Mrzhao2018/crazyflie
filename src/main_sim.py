@@ -25,11 +25,13 @@ from mpl_toolkits.mplot3d import Axes3D
 import matplotlib.gridspec as gridspec
 
 from stress_matrix import (compute_stress_matrix, validate_stress_matrix,
-                           print_validation, compute_sparse_stress_matrix)
+                           print_validation, compute_sparse_stress_matrix,
+                           compute_power_centric_stress_matrix)
 from formation import (
     double_pentagon, affine_transform, scale_matrix,
     rotation_matrix_z, create_leader_trajectory, graph_info, smoothstep,
-    CRAZYFLIE_COMM,
+    CRAZYFLIE_COMM, check_affine_span, build_power_centric_topology,
+    select_leaders_for_direction, compute_dwell_time,
 )
 from afc_controller import AFCController
 from archive import SimArchive
@@ -512,6 +514,205 @@ def simulate_second_order_et(controller, initial_positions,
         }
 
     return times, positions_history, errors, control_inputs, et_data
+
+
+# ============================================================
+# 层级重组 (RHF) 仿真引擎
+# ============================================================
+
+def simulate_rhf(controller, initial_positions, initial_velocities,
+                 nominal_pos, rhf_schedule, t_span, dt=0.02):
+    """
+    层级重组 (Reconfigurable Hierarchical Formation) 仿真。
+
+    在仿真过程中按 rhf_schedule 定义的时间表切换层级：
+      - 切换 leader/follower 角色
+      - 重构通信拓扑（power-centric）
+      - 重新计算应力矩阵
+      - 更新控制器参数
+
+    二阶积分器模型：p̈_f = -K_p(Ω_ff p_f + Ω_fl p_l) - K_d v_f
+
+    参考: Li & Dong (2024) "A Flexible and Resilient Formation Approach
+          based on Hierarchical Reorganization", arXiv:2406.11219
+
+    Parameters
+    ----------
+    controller : AFCController
+        初始控制器（将在运行中被 update_omega 修改）
+    initial_positions : ndarray (n, d)
+        初始位置
+    initial_velocities : ndarray (n, d) or None
+        初始速度
+    nominal_pos : ndarray (n, d)
+        标称编队位置（用于计算各层级的 leader 目标位置）
+    rhf_schedule : list of dict
+        层级切换时间表，每项包含：
+        {
+            't_switch': float,            # 切换时刻
+            'leader_indices': list[int],  # 新 leader 集合
+            'leader_targets': ndarray,    # 新 leader 的目标位置 (n_l, d)
+            't_transition': float,        # leader 位置过渡时间
+            'omega': ndarray,             # 预计算的应力矩阵
+            'adj': ndarray,               # 邻接矩阵
+            'label': str,                 # 阶段标签
+        }
+    t_span : (float, float)
+    dt : float
+
+    Returns
+    -------
+    times : ndarray (n_steps,)
+    positions_history : ndarray (n_steps, n, d)
+    errors : ndarray (n_steps,)
+    control_inputs_history : list of ndarray
+        每步的控制输入（因 n_f 可能变化，用 list 存储）
+    rhf_data : dict
+        层级切换的详细数据
+    """
+    from formation import smoothstep
+
+    n = controller.n
+    d_dim = initial_positions.shape[1]
+
+    times = np.arange(t_span[0], t_span[1] + dt / 2, dt)
+    n_steps = len(times)
+
+    positions_history = np.zeros((n_steps, n, d_dim))
+    errors = np.zeros(n_steps)
+    # 控制输入：因 follower 集合可能变化，记录全体 agent 的加速度
+    accel_history = np.zeros((n_steps, n, d_dim))
+
+    positions = initial_positions.copy()
+    velocities = (initial_velocities.copy() if initial_velocities is not None
+                  else np.zeros_like(initial_positions))
+
+    # 状态追踪
+    switch_log = []           # 每次切换的记录
+    leader_history = []       # (t, leader_indices) 时间线
+    current_phase = -1        # 当前阶段索引
+    phase_start_time = t_span[0]
+
+    # 预处理 schedule：按时间排序
+    schedule = sorted(rhf_schedule, key=lambda s: s['t_switch'])
+
+    # Leader 目标位置管理
+    # 初始阶段：使用 controller 当前的 leader
+    current_leader_targets = positions[controller.leader_indices].copy()
+    prev_leader_targets = current_leader_targets.copy()
+    transition_start = t_span[0]
+    transition_end = t_span[0]
+
+    leader_history.append((t_span[0], controller.leader_indices.copy()))
+
+    for idx in range(n_steps):
+        t = times[idx]
+
+        # ---- 检查是否需要切换层级 ----
+        while (current_phase + 1 < len(schedule) and
+               t >= schedule[current_phase + 1]['t_switch']):
+            current_phase += 1
+            sched = schedule[current_phase]
+
+            # 记录切换前的状态
+            pre_error = errors[max(0, idx - 1)] if idx > 0 else 0.0
+
+            # 保存切换前的 leader 位置（作为过渡起点）
+            prev_leader_targets = positions[sched['leader_indices']].copy()
+
+            # 执行切换
+            switch_info = controller.update_omega(
+                sched['omega'], sched['leader_indices']
+            )
+
+            # 设置 leader 目标和过渡
+            current_leader_targets = sched['leader_targets']
+            transition_start = sched['t_switch']
+            transition_end = sched['t_switch'] + sched.get('t_transition', 5.0)
+
+            switch_log.append({
+                't_switch': sched['t_switch'],
+                'label': sched.get('label', f'phase_{current_phase}'),
+                'switch_info': switch_info,
+                'pre_switch_error': pre_error,
+                'step_idx': idx,
+            })
+            leader_history.append((sched['t_switch'],
+                                   controller.leader_indices.copy()))
+
+            phase_start_time = sched['t_switch']
+
+        # ---- Leader 位置插值（smoothstep 过渡） ----
+        if t <= transition_start:
+            p_l = prev_leader_targets.copy()
+        elif t >= transition_end:
+            p_l = current_leader_targets.copy()
+        else:
+            alpha = smoothstep(t, transition_start, transition_end)
+            p_l = (1 - alpha) * prev_leader_targets + alpha * current_leader_targets
+
+        # ---- 获取当前 leader/follower 索引 ----
+        l_idx = controller.leader_indices
+        f_idx = controller.follower_indices
+        n_f = controller.n_f
+
+        # ---- 更新 leader 位置 ----
+        positions[l_idx] = p_l
+
+        # ---- 记录状态 ----
+        positions_history[idx] = positions.copy()
+
+        # ---- 计算 follower 控制输入 ----
+        p_f = positions[f_idx]
+        v_f = velocities[f_idx]
+
+        u_f = -controller.gain * (controller.Omega_ff @ p_f
+                                  + controller.Omega_fl @ p_l)
+        u_f -= controller.damping * v_f
+        u_f = controller.saturate(u_f)
+
+        # 记录控制输入
+        for k, fi in enumerate(f_idx):
+            accel_history[idx, fi] = u_f[k]
+
+        # ---- 编队误差 ----
+        p_f_star = controller.steady_state(p_l)
+        errors[idx] = np.linalg.norm(p_f - p_f_star)
+
+        # ---- 前向 Euler 积分 ----
+        if idx < n_steps - 1:
+            velocities[f_idx] = v_f + dt * u_f
+            positions[f_idx] = p_f + dt * velocities[f_idx]
+            # Leader 速度近似为零（由外部轨迹驱动）
+            velocities[l_idx] = 0.0
+
+    # ---- 记录每次切换后的误差恢复 ----
+    for log_entry in switch_log:
+        step = log_entry['step_idx']
+        # 找到切换后误差恢复到阈值以下的时刻
+        recovery_threshold = max(0.5, log_entry['pre_switch_error'] * 1.5)
+        recovery_step = None
+        for s in range(step, min(step + int(60.0 / dt), n_steps)):
+            if errors[s] < recovery_threshold:
+                recovery_step = s
+                break
+        log_entry['recovery_time'] = (
+            (times[recovery_step] - log_entry['t_switch'])
+            if recovery_step is not None else float('inf')
+        )
+        log_entry['post_switch_peak_error'] = float(
+            errors[step:min(step + int(15.0 / dt), n_steps)].max()
+        )
+
+    rhf_data = {
+        'switch_log': switch_log,
+        'leader_history': leader_history,
+        'accel_history': accel_history,
+        'schedule': schedule,
+        'n_switches': len(switch_log),
+    }
+
+    return times, positions_history, errors, accel_history, rhf_data
 
 
 # ============================================================
@@ -1696,6 +1897,259 @@ def main():
     print("  已保存: fig15_et_parameter_comparison.png")
 
     # ----------------------------------------------------------
+    # Step 7.8: 层级重组 (RHF) 验证
+    # ----------------------------------------------------------
+    print("\n[Step 7.8] 层级重组 (Hierarchical Reorganization) 验证...")
+    print("  参考: Li & Dong (2024), arXiv:2406.11219")
+
+    # --- 场景设计: 编队 U 形转弯 ---
+    # Phase 0 (0-10s): 编队建立, leaders=[0,1,2,5] (原始)
+    # Phase 1 (10s切换): 编队向 +Y 转弯, 选新 leader
+    # Phase 2 (25s切换): 编队向 -X 转弯, 再选新 leader
+    # Phase 3 (40-50s): 稳态飞行
+
+    rhf_gain = 10.0
+    rhf_u_max = CRAZYFLIE_COMM['max_velocity']
+
+    # 为初始层级预计算 power-centric 应力矩阵
+    print("\n  [预计算] Phase 0: 原始层级 leaders=[0,1,2,5]...")
+    leaders_p0 = [0, 1, 2, 5]
+    span_p0 = check_affine_span(nominal_pos, leaders_p0)
+    print(f"    仿射张成检查: rank={span_p0['rank']}, "
+          f"required={span_p0['required_rank']}, valid={span_p0['valid']}")
+    Omega_p0, info_p0 = compute_power_centric_stress_matrix(
+        nominal_pos, leaders_p0)
+    print(f"    λ_min(Ω_ff) = {info_p0['min_eig_ff']:.6f}, "
+          f"边数 = {info_p0['n_edges']}")
+
+    # Phase 1: 选择 +Y 方向最优 leader
+    print("\n  [预计算] Phase 1: 向 +Y 方向选择 leader...")
+    leaders_p1, sel_info_p1 = select_leaders_for_direction(
+        nominal_pos, direction=[0, 1, 0], n_leaders=4, d=3)
+    span_p1 = check_affine_span(nominal_pos, leaders_p1)
+    print(f"    新 leader: {leaders_p1}")
+    print(f"    选择方法: {sel_info_p1['method']}")
+    print(f"    仿射张成: rank={span_p1['rank']}, valid={span_p1['valid']}")
+    Omega_p1, info_p1 = compute_power_centric_stress_matrix(
+        nominal_pos, leaders_p1)
+    print(f"    λ_min(Ω_ff) = {info_p1['min_eig_ff']:.6f}, "
+          f"边数 = {info_p1['n_edges']}")
+
+    # Phase 2: 选择 -X 方向最优 leader
+    print("\n  [预计算] Phase 2: 向 -X 方向选择 leader...")
+    leaders_p2, sel_info_p2 = select_leaders_for_direction(
+        nominal_pos, direction=[-1, 0, 0], n_leaders=4, d=3)
+    span_p2 = check_affine_span(nominal_pos, leaders_p2)
+    print(f"    新 leader: {leaders_p2}")
+    print(f"    选择方法: {sel_info_p2['method']}")
+    print(f"    仿射张成: rank={span_p2['rank']}, valid={span_p2['valid']}")
+    Omega_p2, info_p2 = compute_power_centric_stress_matrix(
+        nominal_pos, leaders_p2)
+    print(f"    λ_min(Ω_ff) = {info_p2['min_eig_ff']:.6f}, "
+          f"边数 = {info_p2['n_edges']}")
+
+    # Dwell-time 计算
+    dwell_p1 = compute_dwell_time(rhf_gain, info_p1['min_eig_ff'], 2.0, 0.1)
+    dwell_p2 = compute_dwell_time(rhf_gain, info_p2['min_eig_ff'], 2.0, 0.1)
+    print(f"\n  [驻留时间] Phase 1→2 最小驻留: {dwell_p1:.2f}s")
+    print(f"  [驻留时间] Phase 2→3 最小驻留: {dwell_p2:.2f}s")
+
+    # --- Leader 目标位置设计 (温和 U 形转弯) ---
+    # Phase 0: 标称位置 + 小幅 +X 平移
+    targets_p0 = nominal_pos[leaders_p0] + np.array([0.5, 0.0, 0.0])
+    # Phase 1: 标称位置 + 向 +Y 平移
+    targets_p1 = nominal_pos[leaders_p1] + np.array([0.5, 1.0, 0.0])
+    # Phase 2: 标称位置 + 向 -X+Y 平移 (完成 U 形)
+    targets_p2 = nominal_pos[leaders_p2] + np.array([-0.5, 1.0, 0.0])
+
+    # 构建 RHF 调度表 — 阶段间隔满足驻留时间要求
+    rhf_schedule = [
+        {
+            't_switch': 0.0,
+            'leader_indices': leaders_p0,
+            'leader_targets': targets_p0,
+            't_transition': 3.0,
+            'omega': Omega_p0,
+            'adj': info_p0['adj_matrix'],
+            'label': 'Phase 0: 建立+X平移',
+        },
+        {
+            't_switch': 35.0,
+            'leader_indices': leaders_p1,
+            'leader_targets': targets_p1,
+            't_transition': 3.0,
+            'omega': Omega_p1,
+            'adj': info_p1['adj_matrix'],
+            'label': 'Phase 1: +Y转弯',
+        },
+        {
+            't_switch': 70.0,
+            'leader_indices': leaders_p2,
+            'leader_targets': targets_p2,
+            't_transition': 3.0,
+            'omega': Omega_p2,
+            'adj': info_p2['adj_matrix'],
+            'label': 'Phase 2: -X转弯(U形)',
+        },
+    ]
+
+    T_rhf = 105.0
+
+    # --- 运行 RHF 仿真 ---
+    print(f"\n  运行 RHF 仿真 (T={T_rhf}s, {len(rhf_schedule)} 阶段)...")
+    rhf_controller = AFCController(
+        Omega_p0, leaders_p0, gain=rhf_gain, damping=1.0,
+        u_max=rhf_u_max, saturation_type='smooth')
+
+    np.random.seed(123)
+    rhf_init_pos = nominal_pos.copy()
+    rhf_init_pos += np.random.randn(10, 3) * 0.1
+    rhf_init_vel = np.zeros((10, 3))
+
+    (times_rhf, pos_rhf, err_rhf, accel_rhf,
+     rhf_data) = simulate_rhf(
+        rhf_controller, rhf_init_pos, rhf_init_vel,
+        nominal_pos, rhf_schedule, (0, T_rhf), dt=dt)
+
+    print(f"    仿真步数: {len(times_rhf)}")
+    print(f"    层级切换次数: {rhf_data['n_switches']}")
+    for log in rhf_data['switch_log']:
+        print(f"    [{log['label']}] t={log['t_switch']:.1f}s, "
+              f"切换前误差={log['pre_switch_error']:.4f}, "
+              f"峰值误差={log['post_switch_peak_error']:.4f}, "
+              f"恢复时间={log['recovery_time']:.2f}s")
+
+    # --- fig16: RHF 3D 轨迹 ---
+    fig16 = plt.figure(figsize=(14, 10))
+    ax16 = fig16.add_subplot(111, projection='3d')
+    phase_colors = ['#1f77b4', '#ff7f0e', '#2ca02c']  # 3 阶段颜色
+    switch_times = [s['t_switch'] for s in rhf_schedule]
+
+    n_rhf = pos_rhf.shape[1]
+    for i in range(n_rhf):
+        traj = pos_rhf[:, i, :]
+        for p_idx in range(len(rhf_schedule)):
+            t_start = switch_times[p_idx]
+            t_end = (switch_times[p_idx + 1]
+                     if p_idx + 1 < len(switch_times) else T_rhf)
+            mask = (times_rhf >= t_start) & (times_rhf <= t_end)
+            seg = traj[mask]
+            if len(seg) > 1:
+                ax16.plot(seg[:, 0], seg[:, 1], seg[:, 2],
+                          color=phase_colors[p_idx], alpha=0.5, linewidth=0.8)
+        # 起点 / 终点标记
+        ax16.scatter(*traj[0], marker='o', s=30, c='gray', zorder=5)
+        ax16.scatter(*traj[-1], marker='s', s=30, c='red', zorder=5)
+        ax16.text(traj[-1, 0], traj[-1, 1], traj[-1, 2],
+                  f' {i}', fontsize=7)
+
+    # 标注每阶段的 leader
+    for p_idx, sch in enumerate(rhf_schedule):
+        ls = sch['leader_indices']
+        t_mid_idx = np.searchsorted(
+            times_rhf,
+            sch['t_switch'] + (switch_times[p_idx + 1] - sch['t_switch']) / 2
+            if p_idx + 1 < len(switch_times)
+            else sch['t_switch'] + (T_rhf - sch['t_switch']) / 2)
+        t_mid_idx = min(t_mid_idx, len(times_rhf) - 1)
+        for li in ls:
+            mid_pos = pos_rhf[t_mid_idx, li, :]
+            ax16.scatter(*mid_pos, marker='*', s=120,
+                         c=phase_colors[p_idx], edgecolors='k',
+                         zorder=10)
+
+    from matplotlib.lines import Line2D
+    legend_elems = [
+        Line2D([0], [0], color=phase_colors[i], lw=2,
+               label=rhf_schedule[i]['label'])
+        for i in range(len(rhf_schedule))
+    ]
+    legend_elems.append(
+        Line2D([0], [0], marker='*', color='w', markerfacecolor='gold',
+               markersize=12, label='Leader'))
+    ax16.legend(handles=legend_elems, fontsize=8, loc='upper left')
+    ax16.set_xlabel('X (m)')
+    ax16.set_ylabel('Y (m)')
+    ax16.set_zlabel('Z (m)')
+    ax16.set_title('Fig.16 层级重组 — 3D 轨迹 (U-Turn)')
+    fig16.tight_layout()
+    fig16.savefig('e:/crazyflie/src/fig16_rhf_3d_trajectory.png', dpi=150)
+    print("  已保存: fig16_rhf_3d_trajectory.png")
+
+    # --- fig17: RHF 误差演化 + 切换标记 ---
+    fig17, ax17 = plt.subplots(figsize=(12, 5))
+    ax17.plot(times_rhf, err_rhf, 'b-', linewidth=1.0,
+              label='编队误差 $\\|e(t)\\|$')
+
+    for p_idx, sch in enumerate(rhf_schedule):
+        if p_idx == 0:
+            continue  # 初始阶段不画切换线
+        ax17.axvline(sch['t_switch'], color=phase_colors[p_idx],
+                     linestyle='--', linewidth=1.5, alpha=0.8,
+                     label=f"切换@{sch['t_switch']:.0f}s: {sch['label']}")
+
+    # 标注峰值误差和恢复时间
+    for log in rhf_data['switch_log']:
+        peak_t = log['t_switch'] + log['recovery_time'] / 2
+        ax17.annotate(
+            f"峰值={log['post_switch_peak_error']:.3f}\n"
+            f"恢复={log['recovery_time']:.1f}s",
+            xy=(log['t_switch'] + 1, log['post_switch_peak_error']),
+            fontsize=7, color='red',
+            arrowprops=dict(arrowstyle='->', color='red', lw=0.8),
+            xytext=(log['t_switch'] + 3, log['post_switch_peak_error'] * 1.3))
+
+    ax17.set_xlabel('时间 (s)')
+    ax17.set_ylabel('编队误差')
+    ax17.set_title('Fig.17 层级重组 — 误差演化与切换瞬态')
+    ax17.legend(fontsize=8, loc='upper right')
+    ax17.grid(True, alpha=0.3)
+    fig17.tight_layout()
+    fig17.savefig('e:/crazyflie/src/fig17_rhf_error_evolution.png', dpi=150)
+    print("  已保存: fig17_rhf_error_evolution.png")
+
+    # --- fig18: 各阶段通信拓扑对比 ---
+    fig18, axes18 = plt.subplots(1, len(rhf_schedule), figsize=(6 * len(rhf_schedule), 5))
+    if len(rhf_schedule) == 1:
+        axes18 = [axes18]
+    for p_idx, sch in enumerate(rhf_schedule):
+        ax = axes18[p_idx]
+        adj = sch['adj']
+        ls = sch['leader_indices']
+        fs = [j for j in range(n_rhf) if j not in ls]
+        # 使用标称位置的 x-y 坐标作为节点布局
+        pos_2d = {j: (nominal_pos[j, 0], nominal_pos[j, 1]) for j in range(n_rhf)}
+        # 画边
+        for r in range(n_rhf):
+            for c in range(r + 1, n_rhf):
+                if adj[r, c] != 0:
+                    x_vals = [pos_2d[r][0], pos_2d[c][0]]
+                    y_vals = [pos_2d[r][1], pos_2d[c][1]]
+                    ax.plot(x_vals, y_vals, 'k-', linewidth=0.6, alpha=0.4)
+        # 画节点
+        for j in range(n_rhf):
+            color = phase_colors[p_idx] if j in ls else '#cccccc'
+            marker = '*' if j in ls else 'o'
+            size = 200 if j in ls else 80
+            ax.scatter(pos_2d[j][0], pos_2d[j][1],
+                       c=color, marker=marker, s=size,
+                       edgecolors='k', zorder=5)
+            ax.annotate(str(j), pos_2d[j], fontsize=8,
+                        ha='center', va='bottom',
+                        xytext=(0, 6), textcoords='offset points')
+        ax.set_title(f"{sch['label']}\nLeaders={ls}, Edges={int(adj.sum()/2)}",
+                     fontsize=9)
+        ax.set_aspect('equal')
+        ax.grid(True, alpha=0.2)
+    fig18.suptitle('Fig.18 层级重组 — 通信拓扑切换', fontsize=12)
+    fig18.tight_layout()
+    fig18.savefig('e:/crazyflie/src/fig18_rhf_topology.png', dpi=150)
+    print("  已保存: fig18_rhf_topology.png")
+
+    # 恢复控制器到原始状态 (供后续 Step 8 使用)
+    controller.update_omega(Omega, leader_indices)
+
+    # ----------------------------------------------------------
     # Step 8: 验证仿射不变性
     # ----------------------------------------------------------
     print("\n[Step 8] 仿射不变性验证...")
@@ -1738,7 +2192,7 @@ def main():
     eigvals = np.linalg.eigvalsh(Omega)
     print(f"  {np.array2string(eigvals, precision=6)}")
 
-    plt.show()
+    plt.close('all')
 
     # ----------------------------------------------------------
     # Step 9: 存档

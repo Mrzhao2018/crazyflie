@@ -415,3 +415,235 @@ def graph_info(adj_matrix):
     print(f"  度数分布: min={int(degrees.min())}, max={int(degrees.max())}, "
           f"mean={degrees.mean():.1f}")
     print(f"  邻接矩阵对称: {np.allclose(adj_matrix, adj_matrix.T)}")
+
+
+# ============================================================
+# 层级重组 (Hierarchical Reorganization) 工具
+# ============================================================
+# 参考: Li & Dong (2024) "A Flexible and Resilient Formation Approach
+#       based on Hierarchical Reorganization", arXiv:2406.11219
+
+def check_affine_span(positions, leader_indices, d=None):
+    """
+    检查 leader 集合是否仿射张成 R^d。
+
+    仿射张成条件（Theorem IV.1 of Li & Dong 2024）：
+      rank([r_l^T; 1^T]) = d + 1
+    即 leader 位置加上常数行后的矩阵应满秩。
+
+    在 3D 空间中：需要至少 4 个不共面的 leader。
+    在 2D 空间中：需要至少 3 个不共线的 leader。
+
+    Parameters
+    ----------
+    positions : ndarray (n, d)
+        所有智能体的标称位置
+    leader_indices : list of int
+        候选 leader 索引
+    d : int or None
+        空间维数（None 则自动推断）
+
+    Returns
+    -------
+    result : dict
+        'valid': bool - 是否满足仿射张成条件
+        'rank': int   - 实际秩
+        'required_rank': int - 所需秩 (d+1)
+        'condition_number': float - 条件数（越小越好）
+    """
+    if d is None:
+        d = positions.shape[1]
+    r_l = positions[leader_indices]  # (n_l, d)
+    # 构造 [r_l, 1] 矩阵
+    r_bar = np.column_stack([r_l, np.ones(len(leader_indices))])  # (n_l, d+1)
+    rank = np.linalg.matrix_rank(r_bar, tol=1e-10)
+    # 条件数
+    s = np.linalg.svd(r_bar, compute_uv=False)
+    cond = s[0] / s[-1] if s[-1] > 1e-15 else float('inf')
+    return {
+        'valid': rank >= d + 1,
+        'rank': rank,
+        'required_rank': d + 1,
+        'condition_number': float(cond),
+    }
+
+
+def build_power_centric_topology(n, leader_indices, nominal_pos=None, d=3):
+    """
+    构建 power-centric 拓扑（Theorem IV.3 of Li & Dong 2024）。
+
+    规则：
+      - Leader 间全连接（保持 leader 层稳定性）
+      - 每个 Follower 连接所有 Leader（保证 (d+1)-rooted）
+      - Follower 间无连接
+
+    此策略保证 Ω_ff 为对角矩阵（每个 follower 仅与 leader 耦合），
+    确保 det(Ω_ff) > 0。
+
+    Parameters
+    ----------
+    n : int
+        智能体总数
+    leader_indices : list of int
+        leader 索引
+    nominal_pos : ndarray (n, d) or None
+        标称位置（用于可选的距离约束检查）
+    d : int
+        空间维数
+
+    Returns
+    -------
+    adj : ndarray (n, n)
+        邻接矩阵
+    info : dict
+        拓扑信息
+    """
+    leader_set = set(leader_indices)
+    follower_indices = sorted(set(range(n)) - leader_set)
+
+    adj = np.zeros((n, n), dtype=int)
+
+    # Leader 间全连接
+    for i in leader_indices:
+        for j in leader_indices:
+            if i != j:
+                adj[i, j] = 1
+
+    # 每个 follower 连接所有 leader
+    for f in follower_indices:
+        for l in leader_indices:
+            adj[f, l] = 1
+            adj[l, f] = 1
+
+    n_edges = int(np.sum(adj)) // 2
+    degrees = np.sum(adj, axis=1)
+    n_l = len(leader_indices)
+    n_f = len(follower_indices)
+
+    info = {
+        'type': 'power_centric',
+        'n_edges': n_edges,
+        'leader_degree': n_l - 1 + n_f,  # Leader连所有其他leader + 所有follower
+        'follower_degree': n_l,           # Follower只连leader
+        'degree_min': int(degrees.min()),
+        'degree_max': int(degrees.max()),
+    }
+
+    return adj, info
+
+
+def select_leaders_for_direction(positions, direction, n_leaders=4, d=3):
+    """
+    根据运动方向选择最优 leader 集合（Power-Centric 策略）。
+
+    选取策略：
+      1. 计算每个智能体在 direction 方向上的投影值
+      2. 选择投影值最大的 n_leaders 个作为候选
+      3. 验证仿射张成条件（rank check）
+      4. 若不满足，迭代替换直到满足
+
+    Parameters
+    ----------
+    positions : ndarray (n, d)
+        所有智能体当前位置
+    direction : ndarray (d,)
+        目标运动方向（将被归一化）
+    n_leaders : int
+        需要的 leader 数量（3D至少4，2D至少3）
+    d : int
+        空间维数
+
+    Returns
+    -------
+    leader_indices : list of int
+        选取的 leader 索引
+    info : dict
+        选取信息
+    """
+    direction = np.asarray(direction, dtype=float)
+    norm = np.linalg.norm(direction)
+    if norm < 1e-12:
+        raise ValueError("方向向量不能为零向量")
+    direction = direction / norm
+
+    n = len(positions)
+    # 计算每个智能体在目标方向上的投影
+    projections = positions @ direction  # (n,)
+
+    # 按投影值降序排列
+    sorted_indices = np.argsort(-projections)
+
+    # 首先尝试前 n_leaders 个
+    candidates = list(sorted_indices[:n_leaders])
+    span_result = check_affine_span(positions, candidates, d)
+
+    if span_result['valid']:
+        return candidates, {
+            'method': 'direct_projection',
+            'projections': projections,
+            'affine_span': span_result,
+        }
+
+    # 如果不满足仿射张成，贪心搜索：保留投影最大的 d 个，
+    # 然后从剩余中找能补全仿射张成的
+    best_candidates = None
+    best_score = -np.inf
+
+    # 尝试所有 C(n, n_leaders) 组合（小规模可行）
+    from itertools import combinations
+    for combo in combinations(range(n), n_leaders):
+        combo_list = list(combo)
+        sr = check_affine_span(positions, combo_list, d)
+        if sr['valid']:
+            # 得分 = 投影之和（越大越好）- 条件数惩罚
+            score = sum(projections[i] for i in combo_list) \
+                    - 0.01 * sr['condition_number']
+            if score > best_score:
+                best_score = score
+                best_candidates = combo_list
+
+    if best_candidates is None:
+        raise ValueError(
+            f"无法找到满足仿射张成条件的 {n_leaders} 个 leader 组合。"
+            f"请检查编队构型是否退化（如所有点共面/共线）。"
+        )
+
+    span_result = check_affine_span(positions, best_candidates, d)
+    return best_candidates, {
+        'method': 'combinatorial_search',
+        'projections': projections,
+        'affine_span': span_result,
+    }
+
+
+def compute_dwell_time(gain, min_eig_ff, epsilon_0, epsilon_target):
+    """
+    计算层级切换所需的最小驻留时间（Dwell-time 条件）。
+
+    一阶收敛模型下：
+      ||e(t)|| ≤ ε₀ exp(-K_p λ_min t)
+      令 ε₀ exp(-K_p λ_min τ) = ε_target
+      → τ_dwell = ln(ε₀/ε_target) / (K_p λ_min)
+
+    Parameters
+    ----------
+    gain : float
+        控制增益 K_p
+    min_eig_ff : float
+        Ω_ff 的最小特征值 λ_min
+    epsilon_0 : float
+        切换瞬间的初始误差上界
+    epsilon_target : float
+        切换前需要达到的误差阈值
+
+    Returns
+    -------
+    dwell_time : float
+        最小驻留时间（秒）
+    """
+    if min_eig_ff <= 0 or gain <= 0:
+        return float('inf')
+    rate = gain * min_eig_ff
+    if epsilon_0 <= epsilon_target:
+        return 0.0
+    return np.log(epsilon_0 / epsilon_target) / rate

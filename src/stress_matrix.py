@@ -670,3 +670,73 @@ def print_validation(results):
     status = "✓ 全部通过" if results['全部通过'] else "✗ 存在未通过项"
     print(f"\n  总体状态: {status}")
     print("=" * 50)
+
+
+# ============================================================
+# 层级重组 (Hierarchical Reorganization) 应力矩阵计算
+# ============================================================
+
+def compute_power_centric_stress_matrix(positions, leader_indices):
+    """
+    为 Power-Centric 拓扑计算应力矩阵。
+
+    Power-Centric 拓扑（Theorem IV.3 of Li & Dong 2024）：
+      - Leader 间全连接
+      - 每个 Follower 连接所有 Leader
+      - Follower 间无连接
+
+    此拓扑保证 Ω_ff 为对角矩阵，det(Ω_ff) > 0（Proposition 1）。
+    因此非常适合层级重组场景——切换后立即可用。
+
+    Parameters
+    ----------
+    positions : ndarray (n, d)
+        标称编队位置
+    leader_indices : list of int
+        leader 索引
+
+    Returns
+    -------
+    Omega : ndarray (n, n)
+        应力矩阵
+    info : dict
+        计算信息
+    """
+    n, d = positions.shape
+    leader_set = set(leader_indices)
+    follower_indices = sorted(set(range(n)) - leader_set)
+
+    # 构建 power-centric 邻接矩阵
+    adj = np.zeros((n, n), dtype=int)
+    for i in leader_indices:
+        for j in leader_indices:
+            if i != j:
+                adj[i, j] = 1
+    for f in follower_indices:
+        for l in leader_indices:
+            adj[f, l] = 1
+            adj[l, f] = 1
+
+    # 使用标准方法计算应力矩阵
+    Omega, base_info = compute_stress_matrix(positions, adj, leader_indices,
+                                             method='optimize')
+
+    # 附加信息
+    Omega_ff = Omega[np.ix_(follower_indices, follower_indices)]
+    min_eig = float(np.min(np.linalg.eigvalsh(Omega_ff)))
+    n_edges = int(np.sum(adj)) // 2
+
+    info = {
+        **base_info,
+        'topology': 'power_centric',
+        'adj_matrix': adj,
+        'min_eig_ff': min_eig,
+        'n_edges': n_edges,
+        'leader_indices': list(leader_indices),
+        'follower_indices': follower_indices,
+        'omega_ff_diagonal': bool(np.allclose(
+            Omega_ff, np.diag(np.diag(Omega_ff)), atol=1e-8
+        )),
+    }
+
+    return Omega, info

@@ -278,6 +278,28 @@ $$\|e_i\|^2 > \frac{1}{\varphi_i} \|\hat{\xi}_i\|^2 + \mu e^{-\varpi t}$$
 - 完全图: 45 条边, $\lambda_{\min}(\Omega_{ff}) = 0.055$
 - 稀疏图: 29 条边 (↓35.6%), $\lambda_{\min}(\Omega_{ff}) = 0.024$, 度数范围 5~7
 
+### 4.9 层级重组 (Hierarchical Reorganization)
+
+参考文献: Li & Dong (2024), arXiv:2406.11219
+
+**核心思想**: 通过动态切换 Leader 角色和通信拓扑实现时变编队切换。切换过程中保持编队形状不变性和收敛性。
+
+**理论基础**:
+
+1. **动态仿射可定位性 (Theorem IV.1)**: Leader 集合必须仿射张成 $\mathbb{R}^d$，即 $\text{rank}([\mathbf{r}_l; \mathbf{1}^\top]) = d+1$
+2. **可重构仿射可成形性 (Theorem IV.2)**: 所有 Leader 组合可表达为同一仿射像 — 保证切换后编队形状不变
+3. **Power-Centric 拓扑 (Theorem IV.3)**: Follower 仅与 Leader 通信 → $\Omega_{ff}$ 为对角阵 → $\det(\Omega_{ff}) > 0$ 天然保证
+
+**驻留时间条件**: 
+$$\tau_{\text{dwell}} = \frac{\ln(\varepsilon_0 / \varepsilon_{\text{target}})}{K_p \cdot \lambda_{\min}(\Omega_{ff})}$$
+
+**切换流程**:
+1. 根据编队运动方向选择新 Leader（投影法 + 仿射张成校验）
+2. 预计算新拓扑的 Power-Centric 应力矩阵
+3. 到达切换时刻后更新控制器 $\Omega$、Leader 索引
+4. Leader 位置以 smoothstep 过渡到新目标
+5. 等待驻留时间后可再次切换
+
 ---
 
 ## 五、代码模块详细说明
@@ -520,7 +542,39 @@ class EventTriggerManager:
 - 帧率: 20 fps
 - GIF: dpi=100, MP4: dpi=120, bitrate=2000
 
+### 5.10 层级重组 (RHF) 新增函数
+
+分布在多个模块中，实现 Li & Dong (2024) 的层级重组框架。
+
+#### `formation.py` 新增
+
+| 函数 | 功能 |
+|------|------|
+| `check_affine_span(positions, leader_indices, d)` | 检查 Leader 是否仿射张成 R^d |
+| `build_power_centric_topology(n, leader_indices, nominal_pos, d)` | 构建 Power-Centric 邻接矩阵 |
+| `select_leaders_for_direction(positions, direction, n_leaders, d)` | 按运动方向选择最优 Leader 组合 |
+| `compute_dwell_time(gain, min_eig_ff, epsilon_0, epsilon_target)` | 计算最小驻留时间 |
+
+#### `stress_matrix.py` 新增
+
+| 函数 | 功能 |
+|------|------|
+| `compute_power_centric_stress_matrix(positions, leader_indices)` | Power-Centric 拓扑应力矩阵 SDP 求解 |
+
+#### `afc_controller.py` 新增
+
+| 方法 | 功能 |
+|------|------|
+| `AFCController.update_omega(new_omega, new_leader_indices)` | 动态更新控制器 Ω 和 Leader/Follower 索引 |
+
+#### `main_sim.py` 新增
+
+| 函数 | 功能 |
+|------|------|
+| `simulate_rhf(controller, init_pos, init_vel, nominal, schedule, t_span, dt)` | RHF 仿真引擎：按调度表切换层级，smoothstep leader 过渡，记录误差恢复 |
+
 ---
+
 
 ## 六、关键仿真结果
 
@@ -616,6 +670,31 @@ class EventTriggerManager:
 | 一般仿射组合 | 1.04 | 1.287 | 1e-14 |
 
 结论：仿射不变性在所有变换类型下成立至机器精度，验证了 AFC 理论的正确性。仿射变换不限于旋转和缩放，还包括剪切、反射、非均匀缩放及其任意组合。
+
+### 6.7 层级重组 (RHF) 结果
+
+**场景**: 10 机 U 形转弯，3 阶段层级切换，T=105s
+
+| 阶段 | 切换时刻 | Leader | λ_min(Ω_ff) | 边数 | 恢复时间 |
+|------|---------|--------|-------------|------|---------|
+| Phase 0: 建立+X平移 | 0s | [0,1,2,5] | 0.054 | 30 | 4.24s |
+| Phase 1: +Y转弯 | 35s | [6,1,2,5] | 0.020 | 30 | 13.70s |
+| Phase 2: -X转弯 | 70s | [7,3,2,8] | 0.020 | 30 | 16.94s |
+
+**关键指标**:
+- Leader 选择方法: 投影法（direct_projection）
+- 仿射张成验证: 全部通过 (rank=4=d+1)
+- 驻留时间要求: 15.08s
+- 实际阶段间隔: 35s > 15.08s ✓
+- Power-Centric 拓扑: Ω_ff 对角（det > 0 保证）
+- 控制增益: K_p=10.0, K_d=1.0, u_max=1.0 m/s
+
+**可视化**:
+- fig16: 3D 轨迹（分阶段着色 + Leader 标注）
+- fig17: 误差演化（切换瞬态 + 恢复标注）
+- fig18: 通信拓扑切换对比图
+
+结论：层级重组框架成功实现时变编队切换。各阶段均在驻留时间内收敛，Power-Centric 拓扑保证切换后即刻可用，投影法 Leader 选择自动适应不同运动方向。
 
 ---
 
@@ -758,13 +837,40 @@ class EventTriggerManager:
     - 反射变换 (det(A)=-1): 仿射不变性误差 ~1e-14 ✓
     - 4 重组合 (非均匀缩放→斜轴旋转→剪切→一般仿射): 收敛 ✓
     - Monte Carlo 20 次全部收敛，误差 0.71 ± 0.09
+
+### 阶段 12：层级重组（时变编队切换）
+
+30. **文献调研**: 检索 arXiv 前沿文献，确定 Li & Dong (2024, arXiv:2406.11219) 为主要参考
+    - 动态仿射可定位性 (Theorem IV.1)
+    - 可重构仿射可成形性 (Theorem IV.2)
+    - Power-Centric 拓扑 (Theorem IV.3)
+
+31. **核心函数实现**:
+    - `check_affine_span()`: Leader 仿射张成 R^d 校验
+    - `build_power_centric_topology()`: Power-Centric 邻接矩阵构建
+    - `compute_power_centric_stress_matrix()`: SDP 求解 Power-Centric 应力矩阵
+    - `select_leaders_for_direction()`: 投影法 + 仿射张成组合验证
+    - `compute_dwell_time()`: 驻留时间下界计算
+    - `AFCController.update_omega()`: 在线更新控制器 Ω 和角色索引
+
+32. **RHF 仿真引擎** (`simulate_rhf()`):
+    - 按调度表切换层级 (t_switch, leader_indices, Omega, targets)
+    - Leader 位置以 smoothstep 过渡
+    - 记录切换日志: 前误差、峰值误差、恢复时间
+    - U 形转弯场景: 3 阶段切换 (T=105s)，恢复时间 4-17s，均满足驻留时间要求
+
+33. **可视化** (fig16/17/18):
+    - fig16: 3D 轨迹分阶段着色 + Leader 星标
+    - fig17: 误差演化 + 切换竖线 + 恢复标注
+    - fig18: 3 阶段通信拓扑对比图
+
 ---
 
 ## 八、已识别的局限性与改进方向
 
 ### 当前局限性
 
-1. **静态图**: 通信拓扑固定，不支持动态切换/故障恢复
+1. ~~**静态图**~~: **已解决** — 层级重组 (RHF) 实现动态拓扑切换 (见 4.9)
 2. ~~无碰撞避免~~: **已解决** — CBF-QP 安全滤波 (见 4.6)
 3. **简化动力学**: 使用积分器模型，未建模四旋翼实际动力学
 4. **集中式初始化**: 应力矩阵计算需要集中式 SDP，仅控制阶段分布式
@@ -783,9 +889,11 @@ class EventTriggerManager:
 ### 已解决的局限性
 
 - ~~输入无约束~~: 已实现 smooth/norm/clip 三种饱和模式，支持 Crazyflie 速度限制 (u_max=1.0 m/s)
-- ~~无碰撞避免~~: 已实现 CBF-QP 安全滤波器，保证智能体间距 ≥ d_s=0.2m，仅在 24% 时步激活约束- ~~无环境扰动~~: 已实现 ESO 扩展状态观测器，在 [0.2, 0.1, 0.05] m/s 风场 + OU 阵风下编队误差降低 82.6%
+- ~~无碰撞避免~~: 已实现 CBF-QP 安全滤波器，保证智能体间距 ≥ d_s=0.2m，仅在 24% 时步激活约束
+- - ~~无环境扰动~~: 已实现 ESO 扩展状态观测器，在 [0.2, 0.1, 0.05] m/s 风场 + OU 阵风下编队误差降低 82.6%
 - ~~连续通信假设~~: 已实现自适应事件触发通信（二阶积分器），通信量减少 96.1%，误差仅增加 2%
 - ~~仅旋转/缩放变换~~: 已验证剪切、反射、非均匀缩放、一般仿射组合等复杂变换均成立（仿射不变性误差 ~1e-14）
+- ~~静态通信拓扑~~: 已实现层级重组 (RHF)，Power-Centric 拓扑动态切换 Leader，驻留时间保证收敛，3 阶段 U 形转弯验证通过
 ---
 
 ## 九、参考文献索引

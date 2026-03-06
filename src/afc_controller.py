@@ -83,6 +83,56 @@ class AFCController:
         self.Omega_ff = self.Omega[np.ix_(self.follower_indices, self.follower_indices)]
         self.Omega_fl = self.Omega[np.ix_(self.follower_indices, self.leader_indices)]
 
+    def update_omega(self, new_omega, new_leader_indices=None):
+        """
+        动态更新应力矩阵，支持层级重组（Hierarchical Reorganization）。
+
+        切换时序：
+          1. 外部计算新 Omega（基于新拓扑和新 leader 选择）
+          2. 调用 update_omega() 更新控制器内部状态
+          3. 下一个控制步自动使用新参数
+
+        参考：Li & Dong (2024) "A Flexible and Resilient Formation Approach
+              based on Hierarchical Reorganization", arXiv:2406.11219
+
+        Parameters
+        ----------
+        new_omega : ndarray (n, n)
+            新的应力矩阵
+        new_leader_indices : list of int or None
+            新的 leader 索引集合。若为 None，保持当前 leader 不变。
+
+        Returns
+        -------
+        switch_info : dict
+            切换信息，包含新旧参数对比
+        """
+        old_leader_indices = self.leader_indices.copy()
+        old_min_eig = float(np.min(np.linalg.eigvalsh(self.Omega_ff)))
+
+        self.Omega = new_omega
+        if new_leader_indices is not None:
+            self.leader_indices = sorted(new_leader_indices)
+            self.follower_indices = sorted(
+                set(range(self.n)) - set(self.leader_indices)
+            )
+            self.n_l = len(self.leader_indices)
+            self.n_f = len(self.follower_indices)
+
+        # 重新提取子矩阵
+        self.Omega_ff = self.Omega[np.ix_(self.follower_indices, self.follower_indices)]
+        self.Omega_fl = self.Omega[np.ix_(self.follower_indices, self.leader_indices)]
+
+        new_min_eig = float(np.min(np.linalg.eigvalsh(self.Omega_ff)))
+
+        return {
+            'old_leaders': old_leader_indices,
+            'new_leaders': self.leader_indices,
+            'old_min_eig_ff': old_min_eig,
+            'new_min_eig_ff': new_min_eig,
+            'leader_changed': old_leader_indices != self.leader_indices,
+        }
+
     def saturate(self, u):
         """
         对控制输入施加饱和约束。
