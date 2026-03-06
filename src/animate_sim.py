@@ -22,7 +22,10 @@ import os
 import shutil
 
 import matplotlib
-matplotlib.use('TkAgg')
+try:
+    matplotlib.use('TkAgg')
+except Exception:
+    matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.animation import FFMpegWriter, FuncAnimation, PillowWriter
@@ -305,10 +308,10 @@ def run_cbf_scenario(setup):
     init_pos = setup['nominal_pos'].copy()
     init_pos[setup['follower_indices']] += np.random.randn(len(setup['follower_indices']), 3) * 1.5
 
-    times_no, _, err_no, ctrl_no, cbf_no = simulate_first_order_cbf(
+    times_no, _, _, _, cbf_no = simulate_first_order_cbf(
         setup['controller'], init_pos, setup['leader_traj'], (0, setup['T_total']), dt=0.02, cbf_filter=None
     )
-    times_yes, pos_hist, errors, ctrl_yes, cbf_yes = simulate_first_order_cbf(
+    times_yes, pos_hist, errors, _, cbf_yes = simulate_first_order_cbf(
         setup['controller'], init_pos, setup['leader_traj'], (0, setup['T_total']), dt=0.02, cbf_filter=cbf
     )
     pair_hist, pair_dist = _compute_min_pair_history(pos_hist)
@@ -330,10 +333,7 @@ def run_cbf_scenario(setup):
             'min_dist_yes': cbf_yes['min_distances'],
             'n_active': cbf_yes['n_active'],
             'modifications': cbf_yes['modifications'],
-            'err_no': err_no,
             'times_no': times_no,
-            'ctrl_max_no': np.linalg.norm(ctrl_no, axis=2).max(axis=1),
-            'ctrl_max_yes': np.linalg.norm(ctrl_yes, axis=2).max(axis=1),
             'closest_pair': pair_hist,
             'closest_pair_dist': pair_dist,
         },
@@ -357,7 +357,7 @@ def run_eso_scenario(setup):
         wind=None,
         eso=None,
     )
-    times_nd, _, err_nd, ctrl_nd, _ = simulate_first_order_eso(
+    times_nd, _, err_nd, _, _ = simulate_first_order_eso(
         setup['controller'],
         setup['init_pos'],
         setup['leader_traj'],
@@ -366,7 +366,7 @@ def run_eso_scenario(setup):
         wind=WindDisturbance(n_f, dim=3, w_const=w_const, ou_theta=ou_theta, ou_sigma=ou_sigma, seed=wind_seed),
         eso=None,
     )
-    times_wd, pos_hist, errors, ctrl_wd, eso_data = simulate_first_order_eso(
+    times_wd, pos_hist, errors, _, eso_data = simulate_first_order_eso(
         setup['controller'],
         setup['init_pos'],
         setup['leader_traj'],
@@ -403,8 +403,6 @@ def run_eso_scenario(setup):
             'disturbance_est_norm': disturbance_est_norm,
             'estimation_errors': eso_data['estimation_errors'],
             'per_agent_est_error': per_agent_est_error,
-            'ctrl_max_nd': np.linalg.norm(ctrl_nd, axis=2).max(axis=1),
-            'ctrl_max_wd': np.linalg.norm(ctrl_wd, axis=2).max(axis=1),
             'omega_o': omega_o,
             'w_const': w_const,
             'rep_agent': setup['follower_indices'][rep_idx],
@@ -414,16 +412,6 @@ def run_eso_scenario(setup):
 
 def run_et_scenario(setup):
     init_vel = np.zeros_like(setup['init_pos'])
-    times_cont, _, err_cont, _, _ = simulate_second_order_et(
-        setup['controller'],
-        setup['init_pos'],
-        init_vel,
-        setup['leader_traj'],
-        (0, setup['T_total']),
-        dt=0.02,
-        et_manager=None,
-    )
-
     et_mgr = EventTriggerManager(
         n_agents=10,
         d=3,
@@ -446,7 +434,7 @@ def run_et_scenario(setup):
 
     cumulative_counts = _compute_cumulative_trigger_counts(times, et_data['trigger_log'], setup['follower_indices'])
     total_triggers = _compute_total_trigger_curve(cumulative_counts)
-    continuous_baseline = np.linspace(0.0, len(times_cont) * len(setup['follower_indices']), len(times))
+    continuous_baseline = np.arange(len(times), dtype=float) * len(setup['follower_indices'])
 
     return {
         'kind': 'et',
@@ -460,11 +448,7 @@ def run_et_scenario(setup):
         'follower_indices': setup['follower_indices'],
         'phase_specs': _base_phase_specs(setup),
         'extra': {
-            'err_cont': err_cont,
-            'times_cont': times_cont,
             'trigger_log': et_data['trigger_log'],
-            'trigger_counts': et_data['trigger_counts'],
-            'phi_history': et_data['phi_history'],
             'comm_rates': et_data['comm_rates'],
             'cumulative_counts': cumulative_counts,
             'total_triggers': total_triggers,
@@ -993,7 +977,6 @@ def _save_animation(scenario):
         shutil.copy(gif_path, arch._tmp_dir)
     if mp4_ok:
         shutil.copy(mp4_path, arch._tmp_dir)
-    shutil.copy(preview_path, arch._tmp_dir)
     zip_path = arch.finalize()
     print(f"  存档已完成: {zip_path}")
 

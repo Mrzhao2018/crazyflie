@@ -24,9 +24,11 @@ import os
 import numpy as np
 from scipy.integrate import solve_ivp
 import matplotlib
-matplotlib.use('TkAgg')
+try:
+    matplotlib.use('TkAgg')
+except Exception:
+    matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
 import matplotlib.gridspec as gridspec
 
 from stress_matrix import (compute_stress_matrix, validate_stress_matrix,
@@ -585,8 +587,6 @@ def simulate_rhf(controller, initial_positions, initial_velocities,
     rhf_data : dict
         层级切换的详细数据
     """
-    from formation import smoothstep
-
     n = controller.n
     d_dim = initial_positions.shape[1]
 

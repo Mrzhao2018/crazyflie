@@ -19,7 +19,10 @@ import os
 
 import numpy as np
 import matplotlib
-matplotlib.use('TkAgg')
+try:
+    matplotlib.use('TkAgg')
+except Exception:
+    matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 from stress_matrix import compute_stress_matrix, compute_sparse_stress_matrix
@@ -29,7 +32,6 @@ from formation import (
     create_leader_trajectory, CRAZYFLIE_COMM,
 )
 from afc_controller import AFCController
-from event_trigger import EventTriggerManager
 
 # 中文显示
 plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei', 'DejaVu Sans']
