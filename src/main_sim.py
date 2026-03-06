@@ -1058,6 +1058,7 @@ def main():
     # ==== 图4: 应力矩阵热力图 ====
     fig4, axes4 = plt.subplots(1, 3, figsize=(15, 4))
 
+    assert Omega is not None
     # 完整 Ω
     im0 = axes4[0].imshow(Omega, cmap='RdBu_r', aspect='equal')
     axes4[0].set_title('应力矩阵 Ω', fontsize=11)
@@ -2185,6 +2186,7 @@ def main():
     # ----------------------------------------------------------
     # 输出完整的应力矩阵数值
     # ----------------------------------------------------------
+    assert Omega is not None
     print("\n[附录] 应力矩阵 Ω:")
     print(np.array2string(Omega, precision=4, suppress_small=True))
 

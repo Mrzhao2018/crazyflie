@@ -227,7 +227,7 @@ def _solve_sdp(N, edges, n, follower_indices, null_dim):
 
         if min_eig > 1e-8:
             return Omega, {'method': 'SDP', 'min_eig_ff': min_eig,
-                           'sdp_status': prob.status, 'sdp_optimal_t': float(prob.value)}
+                           'sdp_status': prob.status, 'sdp_optimal_t': float(prob.value or 0.0)}  # type: ignore[arg-type]
 
     print(f"[WARN] SDP 未找到正定解 (status={prob.status})，回退到随机搜索")
     return _solve_random(N, edges, n, follower_indices, null_dim)
@@ -437,6 +437,7 @@ def compute_sparse_stress_matrix(positions, leader_indices,
         sparse_edges = candidate_edges
 
     n_sparse = len(sparse_edges)
+    assert Omega is not None and reopt_info is not None
     print(f"    最终稀疏 λ_min(Ω_ff): {reopt_info['min_eig_ff']:.6f}")
     print(f"    最终边数: {n_sparse} (削减率 "
           f"{(1.0 - n_sparse / m_cand) * 100:.1f}%)")
@@ -720,6 +721,7 @@ def compute_power_centric_stress_matrix(positions, leader_indices):
     # 使用标准方法计算应力矩阵
     Omega, base_info = compute_stress_matrix(positions, adj, leader_indices,
                                              method='optimize')
+    assert Omega is not None
 
     # 附加信息
     Omega_ff = Omega[np.ix_(follower_indices, follower_indices)]

@@ -43,7 +43,7 @@ def reflection_matrix_3d(normal):
     return np.eye(3) - 2.0 * np.outer(n, n)
 
 
-def general_affine_matrix(scale=(1, 1, 1), rotate_axis=None, rotate_angle=0,
+def general_affine_matrix(scale=(1, 1, 1), rotate_axis=None, rotate_angle=0.0,
                           shear=(0, 0, 0)):
     """
     组合一般仿射变换矩阵 A = Shear @ Rotate @ Scale。
@@ -319,7 +319,7 @@ def plot_single_result(result, leader_indices, adj, save_prefix=''):
     ax.set_yscale('log')
     ax.grid(True, alpha=0.3)
     # 标注变换阶段
-    colors = plt.cm.Set2(np.linspace(0, 1, max(len(info_list), 1)))
+    colors = plt.colormaps['Set2'](np.linspace(0, 1, max(len(info_list), 1)))
     for k, info in enumerate(info_list):
         ax.axvspan(info['t_start'], info['t_end'],
                    alpha=0.2, color=colors[k], label=info['name'])

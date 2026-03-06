@@ -123,9 +123,9 @@ def main():
     trail_len = min(50, n_frames)
 
     # 预分配绘图对象
-    leader_scatter = ax3d.scatter([], [], [], c='red', s=120, marker='^',
+    leader_scatter = ax3d.scatter([], [], [], c='red', s=120, marker='^',  # type: ignore[arg-type]
                                   edgecolors='darkred', linewidths=0.8, zorder=5)
-    follower_scatter = ax3d.scatter([], [], [], c='dodgerblue', s=70, marker='o',
+    follower_scatter = ax3d.scatter([], [], [], c='dodgerblue', s=70, marker='o',  # type: ignore[arg-type]
                                     edgecolors='navy', linewidths=0.5, zorder=5)
     edge_lines = []
 
@@ -191,8 +191,8 @@ def main():
         # 更新无人机位置
         l_pos = pos[leaders]
         f_pos = pos[followers]
-        leader_scatter._offsets3d = (l_pos[:,0], l_pos[:,1], l_pos[:,2])
-        follower_scatter._offsets3d = (f_pos[:,0], f_pos[:,1], f_pos[:,2])
+        leader_scatter._offsets3d = (l_pos[:,0], l_pos[:,1], l_pos[:,2])  # type: ignore[attr-defined]
+        follower_scatter._offsets3d = (f_pos[:,0], f_pos[:,1], f_pos[:,2])  # type: ignore[attr-defined]
 
         # 更新通信边
         for line in edge_lines:

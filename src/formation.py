@@ -252,7 +252,7 @@ def scale_matrix(d, factor):
         缩放因子（标量为均匀缩放，向量为各维度独立缩放）
     """
     if np.isscalar(factor):
-        return factor * np.eye(d)
+        return float(factor) * np.eye(d)  # type: ignore[arg-type]
     return np.diag(np.asarray(factor))
 
 
@@ -323,7 +323,7 @@ def rotation_matrix_axis(axis, theta):
     return R
 
 
-def shear_matrix_3d(sxy=0, sxz=0, syz=0):
+def shear_matrix_3d(sxy=0.0, sxz=0.0, syz=0.0):
     """
     3D 剪切变换矩阵。
 
