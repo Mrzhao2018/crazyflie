@@ -4,10 +4,8 @@ __pycache__/
 *.pyo
 .venv/
 
-# 生成的图表和动画（可通过 main_sim.py 重新生成）
-src/*.png
-src/*.gif
-src/*.mp4
+# 生成的图表和动画（可通过脚本重新生成）
+outputs/
 
 # 仿真存档数据
 saves/

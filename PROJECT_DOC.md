@@ -31,8 +31,8 @@
 | 项目 | 配置 |
 |------|------|
 | Python 版本 | 3.12.6 |
-| 虚拟环境 | `e:\crazyflie\.venv` |
-| Python 路径 | `e:\crazyflie\.venv\Scripts\python.exe` |
+| 虚拟环境 | `.venv/` |
+| Python 路径 | `.venv/Scripts/python.exe` |
 | 关键包 | cvxpy 1.8.1, numpy 2.4.2, scipy 1.17.1, matplotlib, clarabel, scs, osqp, highspy |
 
 > **⚠️ 重要**: 必须使用 `.venv` 中的 Python，全局 Python 缺少 cvxpy 等关键包！
@@ -58,7 +58,7 @@
 ## 三、项目文件结构
 
 ```
-e:\crazyflie\
+crazyflie/
 ├── .venv/                      # Python 虚拟环境
 ├── docs/                       # 参考文献与毕设文档
 │   ├── 毕设信息.txt             # 毕设题目、任务要求
@@ -890,7 +890,7 @@ class EventTriggerManager:
 
 - ~~输入无约束~~: 已实现 smooth/norm/clip 三种饱和模式，支持 Crazyflie 速度限制 (u_max=1.0 m/s)
 - ~~无碰撞避免~~: 已实现 CBF-QP 安全滤波器，保证智能体间距 ≥ d_s=0.2m，仅在 24% 时步激活约束
-- - ~~无环境扰动~~: 已实现 ESO 扩展状态观测器，在 [0.2, 0.1, 0.05] m/s 风场 + OU 阵风下编队误差降低 82.6%
+- ~~无环境扰动~~: 已实现 ESO 扩展状态观测器，在 [0.2, 0.1, 0.05] m/s 风场 + OU 阵风下编队误差降低 82.6%
 - ~~连续通信假设~~: 已实现自适应事件触发通信（二阶积分器），通信量减少 96.1%，误差仅增加 2%
 - ~~仅旋转/缩放变换~~: 已验证剪切、反射、非均匀缩放、一般仿射组合等复杂变换均成立（仿射不变性误差 ~1e-14）
 - ~~静态通信拓扑~~: 已实现层级重组 (RHF)，Power-Centric 拓扑动态切换 Leader，驻留时间保证收敛，3 阶段 U 形转弯验证通过
@@ -917,14 +917,15 @@ class EventTriggerManager:
 
 ```bash
 # 运行仿真
-cd e:\crazyflie\src
-e:\crazyflie\.venv\Scripts\python.exe main_sim.py
+cd src
+..\.venv\Scripts\python.exe main_sim.py
 
 # 生成动画
-e:\crazyflie\.venv\Scripts\python.exe animate_sim.py
+cd ..
+.\.venv\Scripts\python.exe animate_sim.py
 
 # 安装新包
-e:\crazyflie\.venv\Scripts\pip.exe install <package>
+.\.venv\Scripts\pip.exe install <package>
 
 # WSL2 中启动 CrazyChoir
 source ~/crazychoir_ws/install/setup.bash

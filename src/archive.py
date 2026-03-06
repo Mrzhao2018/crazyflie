@@ -2,7 +2,7 @@
 archive.py - 仿真结果存档系统
 
 每次仿真结束后，将所有图表和数值数据打包为带时间戳的 zip 存档。
-存档保存在 e:/crazyflie/saves/archives/ 目录下。
+存档保存在项目根目录下的 saves/archives/ 目录中。
 
 用法：
     from archive import SimArchive
@@ -24,7 +24,8 @@ from datetime import datetime
 import numpy as np
 
 
-ARCHIVE_DIR = os.path.normpath('e:/crazyflie/saves/archives')
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+ARCHIVE_DIR = os.path.join(ROOT_DIR, 'saves', 'archives')
 
 
 class SimArchive:

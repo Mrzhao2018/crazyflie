@@ -12,9 +12,14 @@ main_sim.py - 仿射编队控制 (AFC) 完整仿真与可视化
 5. 生成可视化图表用于毕设论文
 
 用法：
-    cd e:/crazyflie/src
+    在仓库根目录运行：
+    python src/main_sim.py
+
+    或者在 src 目录运行：
     python main_sim.py
 """
+
+import os
 
 import numpy as np
 from scipy.integrate import solve_ivp
@@ -43,6 +48,16 @@ from event_trigger import EventTriggerManager
 plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei', 'DejaVu Sans']
 plt.rcParams['axes.unicode_minus'] = False
 plt.rcParams['figure.dpi'] = 120
+
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+OUTPUT_DIR = os.path.join(ROOT_DIR, 'outputs')
+FIGURE_DIR = os.path.join(OUTPUT_DIR, 'figures')
+for _dir in (OUTPUT_DIR, FIGURE_DIR):
+    os.makedirs(_dir, exist_ok=True)
+
+
+def figure_path(name):
+    return os.path.join(FIGURE_DIR, name)
 
 
 # ============================================================
@@ -1001,7 +1016,7 @@ def main():
 
     fig1.suptitle('仿射编队控制 - 编队形态变换过程', fontsize=14, y=1.02)
     fig1.tight_layout()
-    fig1.savefig('e:/crazyflie/src/fig1_formation_snapshots.png',
+    fig1.savefig(figure_path('fig1_formation_snapshots.png'),
                  dpi=200, bbox_inches='tight')
     archive.save_figure(fig1, 'fig1_formation_snapshots')
     print("  已保存: fig1_formation_snapshots.png")
@@ -1013,7 +1028,7 @@ def main():
     ax_traj.set_title('智能体 3D 轨迹', fontsize=13)
     ax_traj.legend(['Leader', 'Follower'], loc='upper left')
     fig2.tight_layout()
-    fig2.savefig('e:/crazyflie/src/fig2_trajectories_3d.png',
+    fig2.savefig(figure_path('fig2_trajectories_3d.png'),
                  dpi=200, bbox_inches='tight')
     archive.save_figure(fig2, 'fig2_trajectories_3d')
     print("  已保存: fig2_trajectories_3d.png")
@@ -1050,7 +1065,7 @@ def main():
     axes3[1].grid(True, alpha=0.3)
 
     fig3.tight_layout()
-    fig3.savefig('e:/crazyflie/src/fig3_convergence.png',
+    fig3.savefig(figure_path('fig3_convergence.png'),
                  dpi=200, bbox_inches='tight')
     archive.save_figure(fig3, 'fig3_convergence')
     print("  已保存: fig3_convergence.png")
@@ -1088,7 +1103,7 @@ def main():
 
     fig4.suptitle('应力矩阵结构', fontsize=14)
     fig4.tight_layout()
-    fig4.savefig('e:/crazyflie/src/fig4_stress_matrix.png',
+    fig4.savefig(figure_path('fig4_stress_matrix.png'),
                  dpi=200, bbox_inches='tight')
     archive.save_figure(fig4, 'fig4_stress_matrix')
     print("  已保存: fig4_stress_matrix.png")
@@ -1107,7 +1122,7 @@ def main():
 
     fig5.suptitle('通信拓扑优化: 完全图 vs Crazyflie 约束稀疏图', fontsize=14)
     fig5.tight_layout()
-    fig5.savefig('e:/crazyflie/src/fig5_communication_graph.png',
+    fig5.savefig(figure_path('fig5_communication_graph.png'),
                  dpi=200, bbox_inches='tight')
     archive.save_figure(fig5, 'fig5_communication_graph')
     print("  已保存: fig5_communication_graph.png")
@@ -1173,7 +1188,7 @@ def main():
 
     fig6.suptitle('Crazyflie 通信约束优化效果', fontsize=14)
     fig6.tight_layout()
-    fig6.savefig('e:/crazyflie/src/fig6_sparse_comparison.png',
+    fig6.savefig(figure_path('fig6_sparse_comparison.png'),
                  dpi=200, bbox_inches='tight')
     archive.save_figure(fig6, 'fig6_sparse_comparison')
     print("  已保存: fig6_sparse_comparison.png")
@@ -1252,7 +1267,7 @@ def main():
 
     fig7.suptitle(f'输入饱和约束分析 (u_max = {u_max} m/s, smooth tanh)', fontsize=14)
     fig7.tight_layout()
-    fig7.savefig('e:/crazyflie/src/fig7_saturation_analysis.png',
+    fig7.savefig(figure_path('fig7_saturation_analysis.png'),
                  dpi=200, bbox_inches='tight')
     archive.save_figure(fig7, 'fig7_saturation_analysis')
     print("  已保存: fig7_saturation_analysis.png")
@@ -1295,7 +1310,7 @@ def main():
 
     fig8.suptitle('不同饱和上限对比分析', fontsize=14)
     fig8.tight_layout()
-    fig8.savefig('e:/crazyflie/src/fig8_saturation_comparison.png',
+    fig8.savefig(figure_path('fig8_saturation_comparison.png'),
                  dpi=200, bbox_inches='tight')
     archive.save_figure(fig8, 'fig8_saturation_comparison')
     print("  已保存: fig8_saturation_comparison.png")
@@ -1406,7 +1421,7 @@ def main():
     fig9.suptitle(f'CBF 碰撞避免效果验证 (d_s={d_safe}m, γ={gamma_cbf}, '
                   f'初始扰动σ={cbf_noise_std}m)', fontsize=13)
     fig9.tight_layout()
-    fig9.savefig('e:/crazyflie/src/fig9_cbf_collision_avoidance.png',
+    fig9.savefig(figure_path('fig9_cbf_collision_avoidance.png'),
                  dpi=200, bbox_inches='tight')
     archive.save_figure(fig9, 'fig9_cbf_collision_avoidance')
     print("  已保存: fig9_cbf_collision_avoidance.png")
@@ -1475,7 +1490,7 @@ def main():
 
     fig10.suptitle('CBF 安全滤波器分析', fontsize=14)
     fig10.tight_layout()
-    fig10.savefig('e:/crazyflie/src/fig10_cbf_analysis.png',
+    fig10.savefig(figure_path('fig10_cbf_analysis.png'),
                   dpi=200, bbox_inches='tight')
     archive.save_figure(fig10, 'fig10_cbf_analysis')
     print("  已保存: fig10_cbf_analysis.png")
@@ -1630,7 +1645,7 @@ def main():
                    f'(w0={omega_o}, w_const={w_const_vec}, '
                    f'OU: theta={ou_theta}, sigma={ou_sigma})', fontsize=13)
     fig11.tight_layout()
-    fig11.savefig('e:/crazyflie/src/fig11_eso_disturbance_rejection.png',
+    fig11.savefig(figure_path('fig11_eso_disturbance_rejection.png'),
                   dpi=200, bbox_inches='tight')
     archive.save_figure(fig11, 'fig11_eso_disturbance_rejection')
     print("  已保存: fig11_eso_disturbance_rejection.png")
@@ -1672,7 +1687,7 @@ def main():
 
     fig12.suptitle('ESO 带宽参数 w0 对抗扰性能的影响', fontsize=14)
     fig12.tight_layout()
-    fig12.savefig('e:/crazyflie/src/fig12_eso_bandwidth_comparison.png',
+    fig12.savefig(figure_path('fig12_eso_bandwidth_comparison.png'),
                   dpi=200, bbox_inches='tight')
     archive.save_figure(fig12, 'fig12_eso_bandwidth_comparison')
     print("  已保存: fig12_eso_bandwidth_comparison.png")
@@ -1770,7 +1785,7 @@ def main():
 
     fig13.suptitle('自适应事件触发通信 vs 连续通信 (二阶积分器)', fontsize=14)
     fig13.tight_layout()
-    fig13.savefig('e:/crazyflie/src/fig13_et_error_comparison.png',
+    fig13.savefig(figure_path('fig13_et_error_comparison.png'),
                   dpi=200, bbox_inches='tight')
     archive.save_figure(fig13, 'fig13_et_error_comparison')
     print("  已保存: fig13_et_error_comparison.png")
@@ -1847,7 +1862,7 @@ def main():
     fig14.suptitle(f'自适应事件触发通信分析 '
                    f'(μ={et_mu}, ϖ={et_varpi}, φ₀={et_phi_0})', fontsize=14)
     fig14.tight_layout()
-    fig14.savefig('e:/crazyflie/src/fig14_et_communication_analysis.png',
+    fig14.savefig(figure_path('fig14_et_communication_analysis.png'),
                   dpi=200, bbox_inches='tight')
     archive.save_figure(fig14, 'fig14_et_communication_analysis')
     print("  已保存: fig14_et_communication_analysis.png")
@@ -1892,7 +1907,7 @@ def main():
 
     fig15.suptitle('ET 参数 μ 对性能的影响', fontsize=14)
     fig15.tight_layout()
-    fig15.savefig('e:/crazyflie/src/fig15_et_parameter_comparison.png',
+    fig15.savefig(figure_path('fig15_et_parameter_comparison.png'),
                   dpi=200, bbox_inches='tight')
     archive.save_figure(fig15, 'fig15_et_parameter_comparison')
     print("  已保存: fig15_et_parameter_comparison.png")
@@ -2074,7 +2089,7 @@ def main():
     ax16.set_zlabel('Z (m)')
     ax16.set_title('Fig.16 层级重组 — 3D 轨迹 (U-Turn)')
     fig16.tight_layout()
-    fig16.savefig('e:/crazyflie/src/fig16_rhf_3d_trajectory.png', dpi=150)
+    fig16.savefig(figure_path('fig16_rhf_3d_trajectory.png'), dpi=150)
     print("  已保存: fig16_rhf_3d_trajectory.png")
 
     # --- fig17: RHF 误差演化 + 切换标记 ---
@@ -2106,7 +2121,7 @@ def main():
     ax17.legend(fontsize=8, loc='upper right')
     ax17.grid(True, alpha=0.3)
     fig17.tight_layout()
-    fig17.savefig('e:/crazyflie/src/fig17_rhf_error_evolution.png', dpi=150)
+    fig17.savefig(figure_path('fig17_rhf_error_evolution.png'), dpi=150)
     print("  已保存: fig17_rhf_error_evolution.png")
 
     # --- fig18: 各阶段通信拓扑对比 ---
@@ -2144,7 +2159,7 @@ def main():
         ax.grid(True, alpha=0.2)
     fig18.suptitle('Fig.18 层级重组 — 通信拓扑切换', fontsize=12)
     fig18.tight_layout()
-    fig18.savefig('e:/crazyflie/src/fig18_rhf_topology.png', dpi=150)
+    fig18.savefig(figure_path('fig18_rhf_topology.png'), dpi=150)
     print("  已保存: fig18_rhf_topology.png")
 
     # 恢复控制器到原始状态 (供后续 Step 8 使用)

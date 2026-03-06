@@ -8,9 +8,14 @@ random_test.py - 随机初始状态 + 复杂仿射变换独立测试模块
 4. 自动验证仿射不变性
 
 用法：
-    cd e:/crazyflie/src
+    在仓库根目录运行：
+    python src/random_test.py
+
+    或者在 src 目录运行：
     python random_test.py
 """
+
+import os
 
 import numpy as np
 import matplotlib
@@ -30,6 +35,16 @@ from event_trigger import EventTriggerManager
 plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei', 'DejaVu Sans']
 plt.rcParams['axes.unicode_minus'] = False
 plt.rcParams['figure.dpi'] = 120
+
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+OUTPUT_DIR = os.path.join(ROOT_DIR, 'outputs')
+FIGURE_DIR = os.path.join(OUTPUT_DIR, 'figures')
+for _dir in (OUTPUT_DIR, FIGURE_DIR):
+    os.makedirs(_dir, exist_ok=True)
+
+
+def figure_path(name):
+    return os.path.join(FIGURE_DIR, name)
 
 
 # ============================================================
@@ -353,7 +368,7 @@ def plot_single_result(result, leader_indices, adj, save_prefix=''):
     fig.tight_layout()
 
     if save_prefix:
-        path = f'e:/crazyflie/src/{save_prefix}_single.png'
+        path = figure_path(f'{save_prefix}_single.png')
         fig.savefig(path, dpi=150, bbox_inches='tight')
         print(f"  已保存: {path}")
     return fig
@@ -399,7 +414,7 @@ def plot_monte_carlo(results, summary, save_prefix=''):
     fig.tight_layout()
 
     if save_prefix:
-        path = f'e:/crazyflie/src/{save_prefix}_monte_carlo.png'
+        path = figure_path(f'{save_prefix}_monte_carlo.png')
         fig.savefig(path, dpi=150, bbox_inches='tight')
         print(f"  已保存: {path}")
     return fig
