@@ -1,6 +1,6 @@
 # 项目文档：基于 Crazyflie 开发平台的微型无人机编队控制研究
 
-> 最后更新：2026年3月6日  
+> 最后更新：2026年3月14日  
 > 目的：作为当前仓库的总工作文档，统一记录研究目标、代码结构、仿真入口、模块能力、结果产物和最近重构状态，避免后续重复梳理代码。
 
 ---
@@ -84,6 +84,15 @@ crazyflie/
 │   ├── random_test.py           随机仿射压力测试 + 模块集成测试
 │   ├── stress_matrix.py         应力矩阵与稀疏图/Power-Centric 设计
 │   └── tune_pyramid_safety.py   金字塔任务安全参数自动调优
+├── integration/
+│   ├── config/
+│   │   └── fleet_config.json    真机机群配置（URI、安全边界、坐标变换）
+│   ├── logs/                    真机运行 CSV 日志（按时间戳命名）
+│   └── scripts/
+│       ├── pose_bridge.py       定位桥接（cflib stateEstimate → 算法坐标系）
+│       ├── cf_command_bridge.py 命令下发桥接（速度/位置 setpoint）
+│       ├── safety_guard.py      安全防护层（边界/间距/超时/限幅）
+│       └── formation_runner.py  真机编队主控制循环（第一版接入入口）
 ├── animate_sim.py               根目录动画入口包装脚本
 ├── main_sim.py                  根目录主仿真入口包装脚本
 ├── random_test.py               根目录随机测试入口包装脚本
@@ -423,6 +432,29 @@ CLI：
 - python tune_pyramid_safety.py --quick
 - python tune_pyramid_safety.py --no-write
 
+### 6.11 integration/（真机接入层）
+
+**第一版接入范围**：AFC + 速度限幅 + 基础安全保护（CBF/ESO/ET/RHF 留第二阶段）
+
+| 文件 | 职责 |
+|------|------|
+| `pose_bridge.py` | 订阅 cflib stateEstimate 日志，整理成 (n,3) 位置/速度矩阵；线程安全缓存；坐标系变换 |
+| `cf_command_bridge.py` | 复用 PoseBridge 连接句柄，下发速度 setpoint；起飞/悬停/降落/紧急停止；watchdog keepalive |
+| `safety_guard.py` | 定位新鲜度、边界越界、最小间距、位置误差、速度限幅五项检查；返回 SafetyStatus（SAFE/HOVER/EMERGENCY）|
+| `formation_runner.py` | 主控制循环：连接→等待定位→起飞→20Hz 闭环→安全关闭；CSV 日志；键盘紧急停止 |
+| `fleet_config.json` | 机群 URI、控制频率、安全参数、坐标变换、标称编队位置 |
+
+**运行方式**：
+```
+cd e:/crazyflie
+python integration/scripts/formation_runner.py
+```
+
+**已知局限（第一版）**：
+- 标称编队为 3 机等腰三角形（1 Leader + 2 Follower），10 机版需更新 fleet_config.json
+- 使用完全图应力矩阵（保守策略），大机群可改为 compute_sparse_stress_matrix
+- CBF/ESO/ET/RHF 尚未接入真机闭环
+
 ---
 
 ## 七、配置文件
@@ -666,8 +698,22 @@ Monte Carlo 小规模验证：
 6. 金字塔综合任务实现。
 7. 综合任务安全参数调优脚本实现。
 8. random_test 彻底重构为统一测试入口。
+9. **integration/ 真机接入层第一版实现**（2026年3月14日）。
 
-### 11.2 2026年3月的关键重构
+### 11.2 2026年3月14日：真机接入层代码质量修复
+
+对 `integration/scripts/` 进行了代码质量审查，修复以下问题：
+
+| 优先级 | 文件 | 问题 | 修复 |
+|--------|------|------|------|
+| 高 | `formation_runner.py` | `_emergency_land()` 未设 `self._emergency=True`，导致 `_shutdown()` 可能二次降落 | 补加标志位 |
+| 高 | `pose_bridge.py` | `get_latest_state()` 用 drone id 直接作数组行索引，id 不连续时越界 | 新增 `_id_to_row` 映射 |
+| 高 | `cf_command_bridge.py` | MOCK 模式 `send_follower_velocities()` 静默返回，调试不可见 | 改为 `logger.debug` |
+| 中 | `safety_guard.py` | `_check_min_distance()` 内层循环调用 `np.linalg.norm`，可向量化 | 改用广播预计算距离矩阵 |
+| 中 | `pose_bridge.py` | `start()` 连接失败时已建立的连接未清理 | 失败时调用 `self.stop()` |
+| 中 | `fleet_config.json` | `control.u_max` 与 `safety.max_velocity_mps` 重复，代码只读后者 | 废弃前者并加注释 |
+
+### 11.3 2026年3月的关键重构
 
 本轮重构的核心不是“再加几个功能”，而是统一代码架构：
 

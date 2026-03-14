@@ -1,0 +1,72 @@
+{
+  "_comment": "Crazyflie 真机编队配置文件 — 按照实际飞机和场地修改",
+  "formation": {
+    "n_agents": 3,
+    "leader_indices": [ 0 ],
+    "_comment_leaders": "逻辑编号 0 为 Leader，其余为 Follower；3D 仿射完整需要 4 个 Leader，小测试用 1 个即可",
+    "dim": 3
+  },
+  "drones": [
+    {
+      "id": 0,
+      "role": "leader",
+      "uri": "radio://0/80/2M/E7E7E7E701",
+      "channel": 80,
+      "takeoff_height_m": 0.5,
+      "_comment": "Leader 飞机，手动或按轨迹控制"
+    },
+    { "id": 1, "role": "follower", "uri": "radio://0/80/2M/E7E7E7E702", "channel": 80, "takeoff_height_m": 0.5 },
+    { "id": 2, "role": "follower", "uri": "radio://0/80/2M/E7E7E7E703", "channel": 80, "takeoff_height_m": 0.5 }
+  ],
+  "_comment_full_10": "10 机完整配置：在 drones 数组中增加 id 3-9；uri 末两位从 04 到 0A；leader_indices 改为 [0,1,2,9]",
+  "control": {
+    "freq_hz": 20,
+    "_comment_freq": "第一版建议 20Hz，稳定后可提到 50Hz",
+    "gain": 5.5,
+    "_comment_gain": "与 pyramid_mission_config.json 一致",
+    "_comment_u_max_deprecated": "u_max 字段已废弃，代码实际读取 safety.max_velocity_mps，请在那里修改速度上限",
+    "saturation_type": "norm",
+    "command_type": "velocity",
+    "_comment_cmd": "velocity: send_velocity_world_setpoint；position: send_position_setpoint"
+  },
+  "safety": {
+    "d_safe_m": 0.3,
+    "_comment_dsafe": "真机安全距离 0.3 m，比仿真 0.18 m 大，留更多余量",
+    "d_activate_m": 0.9,
+    "cbf_gamma": 7.0,
+    "max_velocity_mps": 0.4,
+    "max_position_error_m": 2.0,
+    "_comment_poserr": "飞机位置与标称位置差超过此值时触发悬停保护",
+    "pose_timeout_s": 0.5,
+    "_comment_timeout": "定位数据超过此时长未更新时触发悬停",
+    "boundary": {
+      "x_min": -3.0,
+      "x_max": 3.0,
+      "y_min": -3.0,
+      "y_max": 3.0,
+      "z_min": 0.1,
+      "z_max": 2.5,
+      "_comment": "场地安全边界（米），按实际场地修改"
+    },
+    "emergency_key": "q",
+    "_comment_key": "在终端按此键触发全机紧急降落"
+  },
+  "coordinate_transform": {
+    "_comment": "Lighthouse/MoCap 世界坐标到算法坐标系的变换：p_algo = R @ p_world + t",
+    "R": [ [ 1, 0, 0 ], [ 0, 1, 0 ], [ 0, 0, 1 ] ],
+    "t": [ 0.0, 0.0, 0.0 ],
+    "_comment_calibrate": "到场后先运行 calibrate_frame.py 确定这里的 R 和 t"
+  },
+  "nominal_formation": {
+    "_comment": "标称编队位置（算法坐标系，相对编队中心），与 formation.py 中 double_pentagon 对应",
+    "_comment2": "3 机测试版：1 Leader + 2 Follower，呈等腰三角形，间距 1.0 m",
+    "positions": [ [ 0.0, 0.58, 1.0 ], [ -0.5, -0.29, 1.0 ], [ 0.5, -0.29, 1.0 ] ],
+    "_comment_expand": "10 机完整版将此处改为 aerial_pyramid_10() 的输出"
+  },
+  "logging": {
+    "enabled": true,
+    "log_dir": "integration/logs",
+    "log_interval_steps": 1,
+    "_comment": "每控制步记录一次；设为 5 则每 5 步记录一次"
+  }
+}
