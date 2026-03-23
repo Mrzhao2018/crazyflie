@@ -72,6 +72,7 @@ class SafetyGuard:
         s = config['safety']
         self._u_max = float(s['max_velocity_mps'])
         self._d_safe = float(s['d_safe_m'])
+        self._d_activate = float(s.get('d_activate_m', self._d_safe * 3.0))
         self._pose_timeout = float(s['pose_timeout_s'])
         self._max_pos_err = float(s['max_position_error_m'])
 
@@ -139,6 +140,62 @@ class SafetyGuard:
         return status
 
     # ─────────────────────────────────────────
+    # 排斥速度（轻量碰撞避免）
+    # ─────────────────────────────────────────
+
+    def repulsive_velocity(self,
+                           positions: np.ndarray,
+                           velocities_cmd: np.ndarray,
+                           follower_ids: list,
+                           k_rep: float = 1.5) -> np.ndarray:
+        """
+        为 follower 叠加排斥速度，防止飞机间距过近。
+
+        当任意两机距离 d < d_activate 时，对 follower 施加远离方向的排斥速度：
+            v_rep = k_rep * (d_activate/d - 1) * (p_i - p_j) / d
+        d < d_safe 时排斥力达到上限 u_max，保证不会发散。
+
+        Parameters
+        ----------
+        positions : (n, 3)
+        velocities_cmd : (n_f, 3)  AFC 原始输出
+        follower_ids : list of int
+        k_rep : float  排斥增益
+
+        Returns
+        -------
+        velocities_out : (n_f, 3)  叠加排斥后的速度
+        """
+        n = positions.shape[0]
+        d_act = getattr(self, '_d_activate', self._d_safe * 3.0)
+        out = velocities_cmd.copy()
+
+        # follower 逻辑编号 → 输出数组索引
+        fid_to_idx = {fid: idx for idx, fid in enumerate(follower_ids)}
+
+        for i in range(n):
+            if i not in fid_to_idx:
+                continue
+            idx_i = fid_to_idx[i]
+            for j in range(n):
+                if i == j:
+                    continue
+                diff = positions[i] - positions[j]       # i 远离 j 的方向
+                d = float(np.linalg.norm(diff))
+                if d < 1e-6 or d >= d_act:
+                    continue
+                # 排斥强度：d_safe 处 → k_rep，d_activate 处 → 0
+                strength = k_rep * (d_act / d - 1.0)
+                v_rep = strength * diff / d
+                # 限幅：排斥速度不超过 u_max
+                v_rep_norm = float(np.linalg.norm(v_rep))
+                if v_rep_norm > self._u_max:
+                    v_rep = v_rep * (self._u_max / v_rep_norm)
+                out[idx_i] += v_rep
+
+        return out
+
+    # ─────────────────────────────────────────
     # 速度限幅（纯函数，可单独调用）
     # ─────────────────────────────────────────
 
@@ -204,7 +261,7 @@ class SafetyGuard:
                         SafetyStatus.EMERGENCY,
                         f"drone {i}-{j} 距离过近: {d:.3f}m < {self._d_safe:.3f}m"
                     )
-                elif d < self._d_safe * 1.5:
+                elif d < self._d_safe * 1.2:
                     status._escalate(
                         SafetyStatus.HOVER,
                         f"drone {i}-{j} 距离警告: {d:.3f}m"
