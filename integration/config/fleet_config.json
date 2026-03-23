@@ -1,24 +1,28 @@
 {
   "_comment": "Crazyflie 真机编队配置文件 — 按照实际飞机和场地修改",
   "formation": {
-    "n_agents": 3,
-    "leader_indices": [ 0 ],
-    "_comment_leaders": "逻辑编号 0 为 Leader，其余为 Follower；3D 仿射完整需要 4 个 Leader，小测试用 1 个即可",
+    "n_agents": 6,
+    "leader_indices": [ 1, 3, 4, 5 ],
+    "_comment_leaders": "固定 2×3 六机真值顺序：0=cf110_701, 1=cf110_702, 2=cf110_703, 3=cf60_701, 4=cf60_702, 5=cf60_703。当前 3D 仿射 Leader 固定为 cf110_702 + cf60_701/702/703。",
     "dim": 3
   },
   "drones": [
     {
       "id": 0,
-      "role": "leader",
-      "uri": "radio://0/80/2M/E7E7E7E701",
-      "channel": 80,
-      "takeoff_height_m": 0.5,
-      "_comment": "Leader 飞机，手动或按轨迹控制"
+      "role": "follower",
+      "name": "cf110_701",
+      "uri": "radio://0/110/2M/E7E7E7E701",
+      "channel": 110,
+      "takeoff_height_m": 0.4,
+      "_comment": "Follower 飞机（110 组左侧）"
     },
-    { "id": 1, "role": "follower", "uri": "radio://0/80/2M/E7E7E7E702", "channel": 80, "takeoff_height_m": 0.5 },
-    { "id": 2, "role": "follower", "uri": "radio://0/80/2M/E7E7E7E703", "channel": 80, "takeoff_height_m": 0.5 }
+    { "id": 1, "role": "leader", "name": "cf110_702", "uri": "radio://0/110/2M/E7E7E7E702", "channel": 110, "takeoff_height_m": 0.4 },
+    { "id": 2, "role": "follower", "name": "cf110_703", "uri": "radio://0/110/2M/E7E7E7E703", "channel": 110, "takeoff_height_m": 0.4 },
+    { "id": 3, "role": "leader", "name": "cf60_701", "uri": "radio://1/60/2M/E7E7E7E701", "channel": 60, "takeoff_height_m": 0.4 },
+    { "id": 4, "role": "leader", "name": "cf60_702", "uri": "radio://1/60/2M/E7E7E7E702", "channel": 60, "takeoff_height_m": 0.4 },
+    { "id": 5, "role": "leader", "name": "cf60_703", "uri": "radio://1/60/2M/E7E7E7E703", "channel": 60, "takeoff_height_m": 0.4 }
   ],
-  "_comment_full_10": "10 机完整配置：在 drones 数组中增加 id 3-9；uri 末两位从 04 到 0A；leader_indices 改为 [0,1,2,9]",
+  "_comment_full_10": "当前算法融合阶段冻结为 2×3 六机，不再沿用旧 4 机测试布局。",
   "control": {
     "freq_hz": 20,
     "_comment_freq": "第一版建议 20Hz，稳定后可提到 50Hz",
@@ -28,6 +32,19 @@
     "saturation_type": "norm",
     "command_type": "velocity",
     "_comment_cmd": "velocity: send_velocity_world_setpoint；position: send_position_setpoint"
+  },
+  "algorithm_integration": {
+    "mode": "dry_run",
+    "allowed_modes": ["dry_run", "live_single_follower", "live_group"],
+    "first_live_group": ["cf60_701", "cf60_702", "cf60_703"],
+    "single_live_follower": "cf110_701",
+    "planar_only": true,
+    "allow_vertical_velocity": false,
+    "allow_yaw_rate": false,
+    "max_xy_velocity_mps": 0.10,
+    "max_z_velocity_mps": 0.00,
+    "max_live_duration_s": 20.0,
+    "_comment": "算法融合第一阶段：默认 dry_run；先在 cf60 组三机上验证，live 时只允许保守平面速度修正"
   },
   "safety": {
     "d_safe_m": 0.3,
@@ -40,13 +57,13 @@
     "pose_timeout_s": 0.5,
     "_comment_timeout": "定位数据超过此时长未更新时触发悬停",
     "boundary": {
-      "x_min": -3.0,
-      "x_max": 3.0,
-      "y_min": -3.0,
-      "y_max": 3.0,
-      "z_min": 0.1,
-      "z_max": 2.5,
-      "_comment": "场地安全边界（米），按实际场地修改"
+      "x_min": -1.75,
+      "x_max": 1.75,
+      "y_min": -1.75,
+      "y_max": 1.75,
+      "z_min": -0.05,
+      "z_max": 1.5,
+      "_comment": "场地安全边界（米），当前 dry-run / 算法融合阶段按 3.5x3.5x1.5m 场地配置，原点位于中心。"
     },
     "emergency_key": "q",
     "_comment_key": "在终端按此键触发全机紧急降落"
@@ -58,10 +75,19 @@
     "_comment_calibrate": "到场后先运行 calibrate_frame.py 确定这里的 R 和 t"
   },
   "nominal_formation": {
-    "_comment": "标称编队位置（算法坐标系，相对编队中心），与 formation.py 中 double_pentagon 对应",
-    "_comment2": "3 机测试版：1 Leader + 2 Follower，呈等腰三角形，间距 1.0 m",
-    "positions": [ [ 0.0, 0.58, 1.0 ], [ -0.5, -0.29, 1.0 ], [ 0.5, -0.29, 1.0 ] ],
-    "_comment_expand": "10 机完整版将此处改为 aerial_pyramid_10() 的输出"
+    "_comment": "标称编队位置（算法坐标系，相对编队中心），按当前 2×3 六机真值顺序：cf110_701, cf110_702, cf110_703, cf60_701, cf60_702, cf60_703",
+    "_comment_expand": "按当前 2×3 六机真值顺序对齐：cf110_701, cf110_702, cf110_703, cf60_701, cf60_702, cf60_703",
+    "positions": [ [ -0.6, 0.4, 0.4 ], [ 0.0, 0.4, 0.4 ], [ 0.6, 0.4, 0.4 ], [ -0.6, -0.4, 0.4 ], [ 0.0, -0.4, 0.4 ], [ 0.6, -0.4, 0.4 ] ]
+  },
+  "mission": {
+    "type": "affine_demo",
+    "settle_time_s": 8.0,
+    "transition_time_s": 5.0,
+    "hold_time_s": 5.0,
+    "translate_m": [0.2, 0.0, 0.0],
+    "scale_factor": 0.7,
+    "rotate_deg": 30,
+    "_comment": "type=affine_demo 启用仿射变换演示；设为 none 则纯悬停"
   },
   "logging": {
     "enabled": true,
