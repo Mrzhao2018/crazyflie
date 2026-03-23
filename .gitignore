@@ -21,3 +21,22 @@ webots_2023a_amd64.deb
 # IDE
 .vscode/
 .idea/
+
+# Local agent and planning state
+.claude/
+.sisyphus/
+.mcp.json
+
+# Local environments and archives
+WSLUbuntu-24.04/
+WSLubuntu2404.tar
+
+# Build and runtime artifacts
+build/
+install/
+cache/
+log/
+test/
+
+# Integration logs
+integration/logs/
