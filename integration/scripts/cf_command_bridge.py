@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 
 try:
     from cflib.crazyflie.syncCrazyflie import SyncCrazyflie  # noqa: F401
+
     _CFLIB_OK = True
 except ImportError:
     _CFLIB_OK = False
@@ -48,29 +49,71 @@ class CommandBridge:
 
     def __init__(self, config: dict, sc_dict: dict):
         self._cfg = config
-        self._sc = sc_dict          # {id: SyncCrazyflie}
-        self._drones = config['drones']
-        self._ctrl = config['control']
-        self._safety = config['safety']
+        self._sc = sc_dict  # {id: SyncCrazyflie}
+        self._drones = config["drones"]
+        self._ctrl = config["control"]
+        self._safety = config["safety"]
+        self._comm = config.get("communication", {})
 
-        self._cmd_type = self._ctrl.get('command_type', 'velocity')
-        self._u_max = float(self._safety['max_velocity_mps'])
+        self._cmd_type = self._ctrl.get("command_type", "velocity")
+        self._u_max = float(self._safety["max_velocity_mps"])
+        self._startup_enhighlevel_rounds = int(
+            self._comm.get("startup_enhighlevel_rounds", 3)
+        )
+        self._startup_enhighlevel_retry_interval_s = float(
+            self._comm.get("startup_enhighlevel_retry_interval_s", 0.15)
+        )
+        self._startup_enhighlevel_post_delay_s = float(
+            self._comm.get("startup_enhighlevel_post_delay_s", 0.2)
+        )
+        self._takeoff_retries_default = int(self._comm.get("takeoff_retries", 3))
+        self._takeoff_retry_interval_s = float(
+            self._comm.get("takeoff_retry_interval_s", 0.3)
+        )
+        self._takeoff_inter_drone_delay_s = float(
+            self._comm.get("takeoff_inter_drone_delay_s", 0.0)
+        )
+        self._hover_command_interval_s = float(
+            self._comm.get("hover_command_interval_s", 0.3)
+        )
+        self._follower_anchor_refresh_error_m = float(
+            self._comm.get("follower_anchor_refresh_error_m", 0.08)
+        )
+        self._leader_command_spacing_s = float(
+            self._comm.get("leader_command_spacing_s", 0.0)
+        )
+        self._land_retries_default = int(self._comm.get("land_retries", 3))
+        self._land_retry_interval_s = float(
+            self._comm.get("land_retry_interval_s", 0.3)
+        )
+        self._land_inter_drone_delay_s = float(
+            self._comm.get("land_inter_drone_delay_s", 0.0)
+        )
 
         # Leader 列表（不应收到低级速度命令，以免覆盖高级控制器）
-        self._leader_ids = set(config['formation']['leader_indices'])
+        self._leader_ids = set(config["formation"]["leader_indices"])
 
         # 记录每架飞机最后下发命令的时间（防止 commander watchdog 超时）
-        self._last_cmd_t: dict[int, float] = {d['id']: 0.0 for d in self._drones}
+        self._last_cmd_t: dict[int, float] = {d["id"]: 0.0 for d in self._drones}
 
         # Leader 悬停目标位置（takeoff 后由 go_to 锁定）
         self._leader_hover_pos: dict[int, tuple] = {}
+        # Follower dry-run 锁定位姿（用于位置保持 dry-run）
+        self._follower_hold_pos: dict[int, tuple] = {}
+        # 当前由外层 retained-intent / local pacing 驱动的 follower，不参与 anchor keepalive
+        self._dynamic_follower_ids: set[int] = set()
+        self._dynamic_follower_velocity: dict[int, tuple[float, float, float]] = {}
 
     # ─────────────────────────────────────────
     # 起飞 / 降落
     # ─────────────────────────────────────────
 
-    def takeoff_all(self, height_m: float = None, duration_s: float = 3.0,
-                    max_retries: int = 3):
+    def takeoff_all(
+        self,
+        height_m: float | None = None,
+        duration_s: float = 3.0,
+        max_retries: int | None = None,
+    ):
         """
         全机起飞（使用 HighLevelCommander），带重试机制。
 
@@ -88,35 +131,40 @@ class CommandBridge:
             return
 
         logger.info("[CommandBridge] 全机起飞开始...")
+        retries = self._takeoff_retries_default if max_retries is None else max_retries
 
         # 起飞前多轮确认 enHighLevel = 1（对抗 radio 丢包）
         import struct
         from cflib.crtp.crtpstack import CRTPPacket, CRTPPort
+
         PARAM_WRITE_CH = 2
-        for _round in range(3):
+        for _round in range(self._startup_enhighlevel_rounds):
             for drone in self._drones:
-                sc = self._sc.get(drone['id'])
+                sc = self._sc.get(drone["id"])
                 if sc is None:
                     continue
                 try:
                     element = sc.cf.param.toc.get_element_by_complete_name(
-                        'commander.enHighLevel')
+                        "commander.enHighLevel"
+                    )
                     if element:
                         pk = CRTPPacket()
                         pk.set_header(CRTPPort.PARAM, PARAM_WRITE_CH)
-                        pk.data = struct.pack('<H', element.ident)
-                        pk.data += struct.pack('<B', 1)
+                        pk.data = struct.pack("<H", element.ident)
+                        pk.data += struct.pack("<B", 1)
                         sc.cf.send_packet(pk)
                 except Exception:
                     pass
-            time.sleep(0.15)
-        time.sleep(0.2)  # 等参数生效
+                if self._takeoff_inter_drone_delay_s > 0.0:
+                    time.sleep(self._takeoff_inter_drone_delay_s)
+            time.sleep(self._startup_enhighlevel_retry_interval_s)
+        time.sleep(self._startup_enhighlevel_post_delay_s)  # 等参数生效
 
         # 重复发送起飞命令以对抗单 radio 的包丢失
-        for attempt in range(max_retries):
+        for attempt in range(retries):
             for drone in self._drones:
-                did = drone['id']
-                h = height_m if height_m is not None else drone['takeoff_height_m']
+                did = drone["id"]
+                h = height_m if height_m is not None else drone["takeoff_height_m"]
                 sc = self._sc.get(did)
                 if sc is None:
                     if attempt == 0:
@@ -128,8 +176,12 @@ class CommandBridge:
                         logger.info(f"[CommandBridge] drone {did} 起飞 -> {h:.2f}m")
                     self._last_cmd_t[did] = time.time()
                 except Exception as e:
-                    logger.warning(f"[CommandBridge] drone {did} 起飞命令失败 (attempt {attempt}): {e}")
-            time.sleep(0.3)  # 每轮间隔，让 radio 有时间处理
+                    logger.warning(
+                        f"[CommandBridge] drone {did} 起飞命令失败 (attempt {attempt}): {e}"
+                    )
+                if self._takeoff_inter_drone_delay_s > 0.0:
+                    time.sleep(self._takeoff_inter_drone_delay_s)
+            time.sleep(self._takeoff_retry_interval_s)  # 每轮间隔，让 radio 有时间处理
 
         time.sleep(duration_s)  # 等待起飞完成
         logger.info("[CommandBridge] 全机起飞完成")
@@ -148,20 +200,26 @@ class CommandBridge:
         if not _CFLIB_OK:
             return
         for drone in self._drones:
-            did = drone['id']
+            did = drone["id"]
             if did not in self._leader_ids:
                 continue
             sc = self._sc.get(did)
             if sc is None:
                 continue
-            x, y, z = float(positions[did, 0]), float(positions[did, 1]), float(positions[did, 2])
-            h = drone.get('takeoff_height_m', 0.4)
+            x, y, z = (
+                float(positions[did, 0]),
+                float(positions[did, 1]),
+                float(positions[did, 2]),
+            )
+            h = drone.get("takeoff_height_m", 0.4)
             # 用 takeoff_height 而非当前 z（起飞过程中 z 可能还没到位）
             target_z = max(z, h)
             try:
                 sc.cf.high_level_commander.go_to(x, y, target_z, 0.0, 1.0)
                 self._leader_hover_pos[did] = (x, y, target_z)
-                logger.info(f"[CommandBridge] leader {did} 锁定位置 ({x:.2f},{y:.2f},{target_z:.2f})")
+                logger.info(
+                    f"[CommandBridge] leader {did} 锁定位置 ({x:.2f},{y:.2f},{target_z:.2f})"
+                )
             except Exception as e:
                 logger.warning(f"[CommandBridge] leader {did} go_to 失败: {e}")
 
@@ -181,19 +239,132 @@ class CommandBridge:
             sc.cf.high_level_commander.go_to(x, y, z, 0.0, 1.0)
             self._leader_hover_pos[drone_id] = (x, y, z)
             self._last_cmd_t[drone_id] = time.time()
+            if self._leader_command_spacing_s > 0.0:
+                time.sleep(self._leader_command_spacing_s)
         except Exception:
             pass
 
-    def land_all(self, height_m: float = 0.05, duration_s: float = 3.0):
+    def lock_follower_positions(self, positions: np.ndarray, follower_ids: list[int]):
+        """让指定 follower 使用 HLC go_to 锁定当前位置。"""
+        if not _CFLIB_OK:
+            return
+        for did in follower_ids:
+            sc = self._sc.get(did)
+            if sc is None or did in self._leader_ids:
+                continue
+            x, y, z = (
+                float(positions[did, 0]),
+                float(positions[did, 1]),
+                float(positions[did, 2]),
+            )
+            drone = next((d for d in self._drones if d["id"] == did), None)
+            if drone is None:
+                continue
+            h = float(drone.get("takeoff_height_m", 0.4))
+            target_z = max(z, h)
+            try:
+                sc.cf.high_level_commander.go_to(x, y, target_z, 0.0, 1.0)
+                self._follower_hold_pos[did] = (x, y, target_z)
+                self._last_cmd_t[did] = time.time()
+                logger.info(
+                    f"[CommandBridge] follower {did} 锁定位置 ({x:.2f},{y:.2f},{target_z:.2f})"
+                )
+            except Exception as e:
+                logger.warning(f"[CommandBridge] follower {did} go_to 锁定失败: {e}")
+
+    def set_dynamic_followers(self, follower_ids: list[int] | tuple[int, ...]):
+        """标记当前由 retained-intent 驱动的 follower，避免被 anchor keepalive 覆盖。"""
+        new_dynamic_ids = {
+            int(did) for did in follower_ids if int(did) not in self._leader_ids
+        }
+        removed_ids = self._dynamic_follower_ids - new_dynamic_ids
+        for did in removed_ids:
+            self._dynamic_follower_velocity.pop(did, None)
+        self._dynamic_follower_ids = new_dynamic_ids
+
+    def update_dynamic_follower_velocity(
+        self,
+        drone_id: int,
+        vx: float,
+        vy: float,
+        vz: float,
+    ):
+        if drone_id in self._dynamic_follower_ids:
+            self._dynamic_follower_velocity[drone_id] = (
+                float(vx),
+                float(vy),
+                float(vz),
+            )
+
+    def hold_follower_positions_if_due(
+        self,
+        follower_ids: list[int],
+        positions: np.ndarray | None = None,
+        min_interval_s: float | None = None,
+    ) -> list[int]:
+        """对指定 follower 按偏移阈值/最小间隔稀疏重发 HLC go_to。"""
+        if not _CFLIB_OK:
+            return []
+        interval = (
+            self._hover_command_interval_s if min_interval_s is None else min_interval_s
+        )
+        now = time.time()
+        refreshed_ids: list[int] = []
+        for did in follower_ids:
+            if did in self._leader_ids:
+                continue
+            if did in self._dynamic_follower_ids:
+                continue
+            pos = self._follower_hold_pos.get(did)
+            if pos is None:
+                continue
+            if positions is not None:
+                current = positions[did]
+                err = np.linalg.norm(
+                    np.array(current, dtype=float) - np.array(pos, dtype=float)
+                )
+                if err < self._follower_anchor_refresh_error_m:
+                    continue
+            elif now - self._last_cmd_t.get(did, 0.0) < interval:
+                continue
+            sc = self._sc.get(did)
+            if sc is None:
+                continue
+            try:
+                sc.cf.high_level_commander.go_to(pos[0], pos[1], pos[2], 0.0, 1.0)
+                self._last_cmd_t[did] = now
+                refreshed_ids.append(did)
+                break  # stagger: 每轮最多刷新一架 follower，避免双发 burst
+            except Exception as e:
+                logger.warning(f"[CommandBridge] follower {did} 锚点保持失败: {e}")
+        return refreshed_ids
+
+    def land_all(
+        self,
+        height_m: float = 0.05,
+        duration_s: float = 3.0,
+        priority_ids: list[int] | None = None,
+        max_retries: int | None = None,
+    ):
         """全机降落（使用 HighLevelCommander），重复发送以对抗丢包。"""
         if not _CFLIB_OK:
             logger.warning("[CommandBridge] MOCK 模式：land_all() 空操作")
             return
 
         logger.info("[CommandBridge] 全机降落...")
-        for attempt in range(3):
-            for drone in self._drones:
-                did = drone['id']
+        retries = self._land_retries_default if max_retries is None else max_retries
+        ordered_ids = []
+        if priority_ids:
+            for did in priority_ids:
+                if did not in ordered_ids:
+                    ordered_ids.append(did)
+        for drone in self._drones:
+            did = drone["id"]
+            if did not in ordered_ids:
+                ordered_ids.append(did)
+
+        for attempt in range(retries):
+            for did in ordered_ids:
                 sc = self._sc.get(did)
                 if sc is None:
                     continue
@@ -203,7 +374,9 @@ class CommandBridge:
                         logger.info(f"[CommandBridge] drone {did} 降落")
                 except Exception as e:
                     logger.warning(f"[CommandBridge] drone {did} 降落命令失败: {e}")
-            time.sleep(0.3)
+                if self._land_inter_drone_delay_s > 0.0:
+                    time.sleep(self._land_inter_drone_delay_s)
+            time.sleep(self._land_retry_interval_s)
 
         time.sleep(duration_s)
         logger.info("[CommandBridge] 全机降落完成")
@@ -212,9 +385,7 @@ class CommandBridge:
     # 速度 setpoint（主控制命令）
     # ─────────────────────────────────────────
 
-    def send_follower_velocities(self,
-                                 follower_ids: list,
-                                 velocities: np.ndarray):
+    def send_follower_velocities(self, follower_ids: list, velocities: np.ndarray):
         """
         向所有 Follower 下发世界坐标速度 setpoint。
 
@@ -230,7 +401,11 @@ class CommandBridge:
             return
 
         for i, did in enumerate(follower_ids):
-            vx, vy, vz = float(velocities[i, 0]), float(velocities[i, 1]), float(velocities[i, 2])
+            vx, vy, vz = (
+                float(velocities[i, 0]),
+                float(velocities[i, 1]),
+                float(velocities[i, 2]),
+            )
             # 保险限幅（safety_guard 已做过一次，这里再保底）
             speed = np.sqrt(vx**2 + vy**2 + vz**2)
             if speed > self._u_max:
@@ -255,6 +430,12 @@ class CommandBridge:
         if speed > self._u_max:
             s = self._u_max / speed
             vx, vy, vz = vx * s, vy * s, vz * s
+        if drone_id in self._dynamic_follower_ids:
+            self._dynamic_follower_velocity[drone_id] = (
+                float(vx),
+                float(vy),
+                float(vz),
+            )
         sc = self._sc.get(drone_id)
         if sc is None:
             return
@@ -268,18 +449,66 @@ class CommandBridge:
     # 悬停 / 紧急停止
     # ─────────────────────────────────────────
 
+    def _all_follower_ids(self) -> list[int]:
+        return [
+            drone["id"] for drone in self._drones if drone["id"] not in self._leader_ids
+        ]
+
+    def hover_all_if_due(self, min_interval_s: float | None = None):
+        """仅当悬停命令到期时，才向所有 follower 发送零速度命令。"""
+        self.hold_or_hover_followers_if_due(
+            self._all_follower_ids(), min_interval_s=min_interval_s
+        )
+
+    def hold_or_hover_followers_if_due(
+        self,
+        follower_ids: list[int],
+        positions: np.ndarray | None = None,
+        min_interval_s: float | None = None,
+    ):
+        """若 follower 已有 anchor，则走 HLC hold；否则走低级零速度 hover。"""
+        anchored_ids = [did for did in follower_ids if did in self._follower_hold_pos]
+        plain_ids = [did for did in follower_ids if did not in self._follower_hold_pos]
+        if anchored_ids:
+            self.hold_follower_positions_if_due(
+                anchored_ids, positions=positions, min_interval_s=min_interval_s
+            )
+        if plain_ids:
+            self.hover_followers_if_due(plain_ids, min_interval_s=min_interval_s)
+
+    def hover_followers_if_due(
+        self, follower_ids: list[int], min_interval_s: float | None = None
+    ):
+        """仅对超过最小间隔未收到命令的 follower 发送零速度命令。"""
+        interval = (
+            self._hover_command_interval_s if min_interval_s is None else min_interval_s
+        )
+        now = time.time()
+        due_ids = [
+            did
+            for did in follower_ids
+            if (did not in self._leader_ids)
+            and (now - self._last_cmd_t.get(did, 0.0) >= interval)
+        ]
+        if due_ids:
+            self.hover_followers(due_ids)
+
     def hover_all(self):
         """向所有 Follower 发送零速度命令（就地悬停）。
         Leader 保持 HighLevelCommander 的自主位置保持，不发送低级命令。
         """
+        self.hover_followers(self._all_follower_ids())
+
+    def hover_followers(self, follower_ids: list[int]):
+        """仅向指定 follower 发送零速度命令。"""
         if not _CFLIB_OK:
-            logger.warning("[CommandBridge] MOCK 模式：hover_all() 空操作")
+            logger.warning("[CommandBridge] MOCK 模式：hover_followers() 空操作")
             return
 
-        for drone in self._drones:
-            did = drone['id']
+        target_ids = set(follower_ids)
+        for did in target_ids:
             if did in self._leader_ids:
-                continue  # Leader 由高级控制器自主保持位置
+                continue
             sc = self._sc.get(did)
             if sc is None:
                 continue
@@ -287,7 +516,7 @@ class CommandBridge:
                 sc.cf.commander.send_velocity_world_setpoint(0.0, 0.0, 0.0, 0.0)
                 self._last_cmd_t[did] = time.time()
             except Exception as e:
-                logger.warning(f"[CommandBridge] drone {did} 悬停命令失败: {e}")
+                logger.warning(f"[CommandBridge] drone {did} 定向悬停命令失败: {e}")
 
     def stop_all(self):
         """
@@ -300,7 +529,7 @@ class CommandBridge:
 
         logger.warning("[CommandBridge] !!! 紧急停止所有推力 !!!")
         for drone in self._drones:
-            did = drone['id']
+            did = drone["id"]
             sc = self._sc.get(did)
             if sc is None:
                 continue
@@ -319,21 +548,52 @@ class CommandBridge:
         对 Leader 定期重发 go_to 维持位置锁定。
         """
         now = time.time()
+        leader_due: list[int] = []
+        follower_anchor_due: list[int] = []
+        follower_zero_due: list[int] = []
         for drone in self._drones:
-            did = drone['id']
+            did = drone["id"]
             if did in self._leader_ids:
                 # Leader: 每 2 秒重发一次 go_to 防止高级控制器超时
                 if now - self._last_cmd_t.get(did, 0.0) > 2.0:
-                    pos = self._leader_hover_pos.get(did)
-                    if pos is not None:
-                        sc = self._sc.get(did)
-                        if sc is not None:
-                            try:
-                                sc.cf.high_level_commander.go_to(
-                                    pos[0], pos[1], pos[2], 0.0, 2.0)
-                                self._last_cmd_t[did] = now
-                            except Exception:
-                                pass
+                    if self._leader_hover_pos.get(did) is not None:
+                        leader_due.append(did)
             else:
-                if now - self._last_cmd_t.get(did, 0.0) > watchdog_interval_s:
-                    self.send_drone_velocity(did, 0.0, 0.0, 0.0)
+                hold_pos = self._follower_hold_pos.get(did)
+                if did in self._dynamic_follower_ids:
+                    if now - self._last_cmd_t.get(did, 0.0) > watchdog_interval_s:
+                        follower_zero_due.append(did)
+                elif hold_pos is not None:
+                    if now - self._last_cmd_t.get(did, 0.0) > 2.0:
+                        follower_anchor_due.append(did)
+                elif now - self._last_cmd_t.get(did, 0.0) > watchdog_interval_s:
+                    follower_zero_due.append(did)
+
+        if leader_due:
+            did = leader_due[0]
+            pos = self._leader_hover_pos.get(did)
+            sc = self._sc.get(did)
+            if pos is not None and sc is not None:
+                try:
+                    sc.cf.high_level_commander.go_to(pos[0], pos[1], pos[2], 0.0, 2.0)
+                    self._last_cmd_t[did] = now
+                except Exception:
+                    pass
+
+        if follower_anchor_due:
+            self.hold_follower_positions_if_due(
+                [follower_anchor_due[0]], positions=None, min_interval_s=0.0
+            )
+
+        if follower_zero_due:
+            did = follower_zero_due[0]
+            retained_velocity = self._dynamic_follower_velocity.get(did)
+            if did in self._dynamic_follower_ids and retained_velocity is not None:
+                self.send_drone_velocity(
+                    did,
+                    retained_velocity[0],
+                    retained_velocity[1],
+                    retained_velocity[2],
+                )
+            else:
+                self.send_drone_velocity(did, 0.0, 0.0, 0.0)

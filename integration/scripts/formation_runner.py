@@ -51,6 +51,30 @@ from safety_guard import (
     SafetyGuard,
     SafetyStatus,
 )  # integration/scripts/safety_guard.py
+from stage_a_runtime import (
+    CoordinatorCommandIntent,
+    CoordinatorLeaderUpdate,
+    CoordinatorTickPlan,
+    FollowerIntent,
+    StageARuntimeComponents,
+    StageARuntimeSnapshot,
+    _MissionCoordinator,
+    _StateAggregator,
+    _SubgroupControllerStateStore,
+)
+from stage_a_execution import (
+    CommandExecutionResult,
+    SafetyExecutionDecision,
+    SubgroupExecutionResult,
+    _RadioGroupExecutor,
+    _SafetyArbiter,
+)
+from stage_a_startup import (
+    StageAStartupComponents,
+    _ControlLoopEntrypoint,
+    _PreflightInspector,
+    _TakeoffVerifier,
+)
 
 # ─────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -118,6 +142,29 @@ class FormationRunner:
         self._max_xy_velocity = float(algo_cfg.get("max_xy_velocity_mps", 0.10))
         self._max_z_velocity = float(algo_cfg.get("max_z_velocity_mps", 0.0))
         self._max_live_duration = float(algo_cfg.get("max_live_duration_s", 20.0))
+        self._dry_run_print_interval = int(
+            algo_cfg.get("dry_run_print_interval_steps", 20)
+        )
+        self._leader_update_interval_s = float(
+            algo_cfg.get("leader_update_interval_s", 0.2)
+        )
+        stage_b_cfg = self._cfg.get("stage_b", {})
+        self._stage_b_enabled = bool(stage_b_cfg.get("enabled", False))
+        self._single_follower_intent_refresh_s = float(
+            stage_b_cfg.get("single_follower_intent_refresh_s", 0.5)
+        )
+        self._single_follower_target_change_threshold_m = float(
+            stage_b_cfg.get("single_follower_target_change_threshold_m", 0.05)
+        )
+        self._single_follower_target_change_threshold_rad = float(
+            stage_b_cfg.get("single_follower_target_change_threshold_rad", 0.0)
+        )
+        self._single_follower_use_velocity_fallback = bool(
+            stage_b_cfg.get("single_follower_use_velocity_fallback", True)
+        )
+        self._single_follower_max_refresh_jitter_s = float(
+            stage_b_cfg.get("single_follower_max_refresh_jitter_s", 0.1)
+        )
 
         # ── 编队参数 ──
         formation_cfg = self._cfg["formation"]
@@ -157,6 +204,32 @@ class FormationRunner:
         os.makedirs(self._log_dir, exist_ok=True)
         self._log_file = None
         self._csv_writer = None
+        self._last_log_flush_step = -1
+        self._log_flush_interval = max(1, int(log_cfg.get("flush_interval_steps", 10)))
+        self._last_leader_update_t = -1.0
+        self._leader_update_rr_index = 0
+
+        # ── 低频分段 profile ──
+        prof_cfg = self._cfg.get("profiling", {})
+        self._profiling_enabled = bool(prof_cfg.get("enabled", False))
+        self._profiling_interval = max(1, int(prof_cfg.get("interval_steps", 50)))
+        self._profiling_warn_threshold_ms = float(
+            prof_cfg.get("warn_threshold_ms", 150.0)
+        )
+
+        # ── Stage A runtime components ──
+        self._stage_a = StageARuntimeComponents(
+            state_aggregator=_StateAggregator(self),
+            mission_coordinator=_MissionCoordinator(self),
+            subgroup_controller_state=_SubgroupControllerStateStore(self),
+            safety_arbiter=_SafetyArbiter(self),
+            radio_group_executor=_RadioGroupExecutor(self),
+        )
+        self._stage_a_startup = StageAStartupComponents(
+            preflight_inspector=_PreflightInspector(self),
+            takeoff_verifier=_TakeoffVerifier(self),
+            control_loop_entrypoint=_ControlLoopEntrypoint(self),
+        )
 
         # ── 紧急停止键盘监听线程 ──
         self._kbd_thread = threading.Thread(target=self._keyboard_listener, daemon=True)
@@ -300,6 +373,466 @@ class FormationRunner:
             f"缩放 {scale}x → 旋转 {rotate_deg}° → 复位"
         )
 
+    def _build_stage_a_runtime_snapshot(self, state: dict) -> StageARuntimeSnapshot:
+        radio_groups: dict[tuple[int, int], list[int]] = {}
+        for drone in self._cfg["drones"]:
+            uri = str(drone["uri"])
+            parts = uri.split("/")
+            radio_idx = int(parts[2])
+            channel = int(parts[3])
+            radio_groups.setdefault((radio_idx, channel), []).append(int(drone["id"]))
+        return StageARuntimeSnapshot(
+            raw_state=state,
+            positions=np.array(state["positions"], copy=True),
+            disconnected_ids=tuple(sorted(state.get("disconnected_ids", []))),
+            radio_groups={key: tuple(ids) for key, ids in radio_groups.items()},
+        )
+
+    def _resolve_single_live_follower(self) -> tuple[int, int, tuple[int, ...]]:
+        live_target = self._cfg["algorithm_integration"]["single_live_follower"]
+        live_ids = [
+            d["id"] for d in self._cfg["drones"] if d.get("name") == live_target
+        ]
+        if not live_ids:
+            raise RuntimeError(
+                f"single_live_follower={live_target!r} not found in config"
+            )
+        did = int(live_ids[0])
+        if did not in self._follower_indices:
+            raise RuntimeError(
+                f"single_live_follower={live_target!r} is not a follower"
+            )
+        follower_index = self._follower_indices.index(did)
+        hover_ids = tuple(fid for fid in self._follower_indices if fid != did)
+        return did, follower_index, hover_ids
+
+    def _initialize_stage_b_single_follower_state(self, state: dict):
+        if self._algorithm_mode != "live_single_follower":
+            return
+        did, follower_index, hover_ids = self._resolve_single_live_follower()
+        self._stage_a.subgroup_controller_state.initialize_single_follower(
+            active_follower_id=did,
+            active_follower_index=follower_index,
+            parked_follower_ids=hover_ids,
+        )
+        if self._cmd_bridge is not None:
+            if self._stage_b_enabled:
+                self._cmd_bridge.set_dynamic_followers([did])
+            else:
+                self._cmd_bridge.set_dynamic_followers([])
+
+    def _build_coordinator_tick_plan(
+        self, runtime_snapshot: StageARuntimeSnapshot, t_elapsed: float
+    ) -> CoordinatorTickPlan:
+        leader_update = CoordinatorLeaderUpdate(should_update=False)
+        leader_traj = self._leader_traj
+        should_update_leaders = leader_traj is not None and (
+            self._last_leader_update_t < 0.0
+            or (t_elapsed - self._last_leader_update_t)
+            >= self._leader_update_interval_s
+        )
+        if should_update_leaders:
+            if leader_traj is None:
+                raise RuntimeError("Leader trajectory 未初始化")
+            leader_targets = leader_traj(t_elapsed)
+            n_leaders = len(self._leader_indices)
+            rr_idx = self._leader_update_rr_index % max(1, n_leaders)
+            lid = self._leader_indices[rr_idx]
+            leader_update = CoordinatorLeaderUpdate(
+                should_update=True,
+                target_drone_id=lid,
+                target_position=(
+                    float(leader_targets[rr_idx, 0]),
+                    float(leader_targets[rr_idx, 1]),
+                    float(leader_targets[rr_idx, 2]),
+                ),
+            )
+
+        desired_follower_velocities = self._afc.all_follower_inputs(
+            runtime_snapshot.positions
+        )
+        desired_follower_velocities = self._guard.repulsive_velocity(
+            runtime_snapshot.positions,
+            desired_follower_velocities,
+            self._follower_indices,
+        )
+
+        command_intent = CoordinatorCommandIntent(mode=self._algorithm_mode)
+        if self._algorithm_mode == "live_single_follower":
+            did, follower_index, hover_ids = self._resolve_single_live_follower()
+            command_intent = CoordinatorCommandIntent(
+                mode=self._algorithm_mode,
+                target_drone_id=did,
+                target_follower_index=follower_index,
+                hover_ids=hover_ids,
+            )
+
+        return CoordinatorTickPlan(
+            runtime_snapshot=runtime_snapshot,
+            positions=runtime_snapshot.positions,
+            disconnected_ids=runtime_snapshot.disconnected_ids,
+            t_elapsed=t_elapsed,
+            leader_update=leader_update,
+            desired_follower_velocities=desired_follower_velocities,
+            command_intent=command_intent,
+        )
+
+    def _apply_coordinator_leader_update(
+        self, cmd_bridge: CommandBridge, leader_update: CoordinatorLeaderUpdate
+    ):
+        if not leader_update.should_update:
+            return
+        if (
+            leader_update.target_drone_id is None
+            or leader_update.target_position is None
+        ):
+            raise RuntimeError("Leader update intent 不完整")
+        x, y, z = leader_update.target_position
+        cmd_bridge.update_leader_target(leader_update.target_drone_id, x, y, z)
+        self._leader_update_rr_index = (self._leader_update_rr_index + 1) % max(
+            1, len(self._leader_indices)
+        )
+
+    def _finalize_command_intent(
+        self,
+        tick_plan: CoordinatorTickPlan,
+        u_safe: np.ndarray,
+    ) -> CoordinatorCommandIntent:
+        command_intent = tick_plan.command_intent
+        if (
+            command_intent.mode != "live_single_follower"
+            or not self._stage_b_enabled
+            or command_intent.target_drone_id is None
+            or command_intent.target_follower_index is None
+        ):
+            return command_intent
+
+        state = self._stage_a.subgroup_controller_state.get_single_follower_state()
+        now = tick_plan.t_elapsed
+        target_index = command_intent.target_follower_index
+        target_id = command_intent.target_drone_id
+        velocity_world = (
+            float(u_safe[target_index, 0]),
+            float(u_safe[target_index, 1]),
+            float(u_safe[target_index, 2]),
+        )
+        current_position = tick_plan.positions[target_id]
+        target_position = (
+            float(
+                current_position[0]
+                + velocity_world[0] * self._single_follower_intent_refresh_s
+            ),
+            float(
+                current_position[1]
+                + velocity_world[1] * self._single_follower_intent_refresh_s
+            ),
+            float(
+                current_position[2]
+                + velocity_world[2] * self._single_follower_intent_refresh_s
+            ),
+        )
+
+        refresh_reason = "steady_state"
+        requires_refresh = False
+        retained_intent = state.retained_intent
+        if retained_intent is None:
+            refresh_reason = "startup"
+            requires_refresh = True
+        else:
+            target_delta = np.linalg.norm(
+                np.array(target_position, dtype=float)
+                - np.array(retained_intent.target_position, dtype=float)
+            )
+            velocity_delta = np.linalg.norm(
+                np.array(velocity_world, dtype=float)
+                - np.array(retained_intent.velocity_world, dtype=float)
+            )
+            if target_delta >= self._single_follower_target_change_threshold_m:
+                refresh_reason = "target_delta"
+                requires_refresh = True
+            elif velocity_delta >= self._single_follower_target_change_threshold_m:
+                refresh_reason = "velocity_delta"
+                requires_refresh = True
+            elif (now - state.last_refresh_at) >= (
+                self._single_follower_intent_refresh_s
+                + self._single_follower_max_refresh_jitter_s
+            ):
+                refresh_reason = "refresh_timer"
+                requires_refresh = True
+            elif state.last_applied_mode != command_intent.mode:
+                refresh_reason = "mode_switch"
+                requires_refresh = True
+
+        follower_intent = FollowerIntent(
+            target_drone_id=target_id,
+            target_follower_index=target_index,
+            target_position=target_position,
+            velocity_world=velocity_world,
+            hover_ids=command_intent.hover_ids,
+            refresh_reason=refresh_reason,
+            requires_transport_refresh=requires_refresh,
+            created_at=now,
+            stale_after_s=self._single_follower_intent_refresh_s,
+        )
+        self._stage_a.subgroup_controller_state.retain_single_follower_intent(
+            follower_intent
+        )
+        return CoordinatorCommandIntent(
+            mode=command_intent.mode,
+            target_drone_id=command_intent.target_drone_id,
+            target_follower_index=command_intent.target_follower_index,
+            hover_ids=command_intent.hover_ids,
+            follower_intent=follower_intent,
+        )
+
+    def _execute_live_single_follower_intent(
+        self,
+        cmd_bridge: CommandBridge,
+        runtime_snapshot: StageARuntimeSnapshot,
+        command_intent: CoordinatorCommandIntent,
+    ) -> CommandExecutionResult:
+        follower_intent = command_intent.follower_intent
+        if follower_intent is None:
+            raise RuntimeError("live_single_follower 缺少 follower_intent")
+
+        cmd_bridge.set_dynamic_followers([follower_intent.target_drone_id])
+        subgroup_results: list[SubgroupExecutionResult] = []
+        if follower_intent.requires_transport_refresh:
+            vx, vy, vz = follower_intent.velocity_world
+            if self._single_follower_use_velocity_fallback:
+                cmd_bridge.update_dynamic_follower_velocity(
+                    follower_intent.target_drone_id,
+                    vx,
+                    vy,
+                    vz,
+                )
+                cmd_bridge.send_drone_velocity(
+                    follower_intent.target_drone_id, vx, vy, vz
+                )
+                self._stage_a.subgroup_controller_state.mark_single_follower_refresh(
+                    follower_intent.created_at,
+                    command_intent.mode,
+                )
+                self._stage_a.subgroup_controller_state.mark_single_follower_transport_send(
+                    follower_intent.created_at,
+                )
+                active_group = next(
+                    (
+                        radio_group
+                        for radio_group, drone_ids in runtime_snapshot.radio_groups.items()
+                        if follower_intent.target_drone_id in drone_ids
+                    ),
+                    None,
+                )
+                if active_group is not None:
+                    subgroup_results.append(
+                        SubgroupExecutionResult(
+                            radio_group=active_group,
+                            executed_ids=(follower_intent.target_drone_id,),
+                            action=f"intent_refresh:{follower_intent.refresh_reason}",
+                        )
+                    )
+        else:
+            vx, vy, vz = follower_intent.velocity_world
+            cmd_bridge.update_dynamic_follower_velocity(
+                follower_intent.target_drone_id,
+                vx,
+                vy,
+                vz,
+            )
+        refreshed_ids = cmd_bridge.hold_follower_positions_if_due(
+            list(follower_intent.hover_ids),
+            positions=runtime_snapshot.positions,
+        )
+        for radio_group, drone_ids in runtime_snapshot.radio_groups.items():
+            executed_ids = tuple(did for did in drone_ids if did in refreshed_ids)
+            if executed_ids:
+                subgroup_results.append(
+                    SubgroupExecutionResult(
+                        radio_group=radio_group,
+                        executed_ids=executed_ids,
+                        action="hold_follower_anchor_if_due",
+                    )
+                )
+        action = "live_single_follower_intent_refresh"
+        if not follower_intent.requires_transport_refresh:
+            action = "live_single_follower_intent_hold"
+        return CommandExecutionResult(
+            action=action,
+            subgroup_results=tuple(subgroup_results),
+        )
+
+    def _apply_subgroup_hover_if_due(
+        self,
+        cmd_bridge: CommandBridge,
+        radio_groups: dict[tuple[int, int], tuple[int, ...]],
+        hover_ids: tuple[int, ...],
+    ) -> tuple[SubgroupExecutionResult, ...]:
+        hover_set = set(hover_ids)
+        results: list[SubgroupExecutionResult] = []
+        for drone_ids in radio_groups.values():
+            subgroup_hover_ids = [did for did in drone_ids if did in hover_set]
+            if subgroup_hover_ids:
+                cmd_bridge.hover_followers_if_due(subgroup_hover_ids)
+                results.append(
+                    SubgroupExecutionResult(
+                        radio_group=next(
+                            key for key, ids in radio_groups.items() if ids == drone_ids
+                        ),
+                        executed_ids=tuple(subgroup_hover_ids),
+                        action="hover_if_due",
+                    )
+                )
+        return tuple(results)
+
+    def _apply_subgroup_follower_velocities(
+        self,
+        cmd_bridge: CommandBridge,
+        radio_groups: dict[tuple[int, int], tuple[int, ...]],
+        follower_ids: list[int],
+        u_safe: np.ndarray,
+    ) -> tuple[SubgroupExecutionResult, ...]:
+        follower_to_velocity = {
+            did: u_safe[idx] for idx, did in enumerate(follower_ids)
+        }
+        results: list[SubgroupExecutionResult] = []
+        for drone_ids in radio_groups.values():
+            subgroup_follower_ids = [
+                did for did in drone_ids if did in follower_to_velocity
+            ]
+            if not subgroup_follower_ids:
+                continue
+            subgroup_u = np.array(
+                [follower_to_velocity[did] for did in subgroup_follower_ids],
+                dtype=float,
+            )
+            cmd_bridge.send_follower_velocities(subgroup_follower_ids, subgroup_u)
+            results.append(
+                SubgroupExecutionResult(
+                    radio_group=next(
+                        key for key, ids in radio_groups.items() if ids == drone_ids
+                    ),
+                    executed_ids=tuple(subgroup_follower_ids),
+                    action="send_follower_velocities",
+                )
+            )
+        return tuple(results)
+
+    def _apply_command_intent(
+        self,
+        cmd_bridge: CommandBridge,
+        runtime_snapshot: StageARuntimeSnapshot,
+        u_safe: np.ndarray,
+        command_intent: CoordinatorCommandIntent,
+        step: int,
+    ) -> CommandExecutionResult:
+        if command_intent.mode == "dry_run":
+            if step % self._dry_run_print_interval == 0:
+                logger.info(
+                    f"[FormationRunner] DRY-RUN step={step} "
+                    f"followers={self._follower_indices} "
+                    f"u_safe={np.array2string(u_safe, precision=3, suppress_small=True)}"
+                )
+            refreshed_ids = cmd_bridge.hold_follower_positions_if_due(
+                self._follower_indices,
+                positions=runtime_snapshot.positions,
+            )
+            subgroup_results = tuple(
+                SubgroupExecutionResult(
+                    radio_group=radio_group,
+                    executed_ids=tuple(
+                        did for did in drone_ids if did in refreshed_ids
+                    ),
+                    action="hold_follower_anchor_if_due",
+                )
+                for radio_group, drone_ids in runtime_snapshot.radio_groups.items()
+                if any(did in refreshed_ids for did in drone_ids)
+            )
+            return CommandExecutionResult(
+                action="dry_run_hold_anchor_if_due",
+                subgroup_results=subgroup_results,
+            )
+
+        if command_intent.mode == "live_single_follower":
+            if self._stage_b_enabled:
+                return self._execute_live_single_follower_intent(
+                    cmd_bridge,
+                    runtime_snapshot,
+                    command_intent,
+                )
+            if (
+                command_intent.target_drone_id is None
+                or command_intent.target_follower_index is None
+            ):
+                raise RuntimeError("live_single_follower command intent 不完整")
+            vx, vy, vz = [
+                float(x) for x in u_safe[command_intent.target_follower_index]
+            ]
+            cmd_bridge.send_drone_velocity(command_intent.target_drone_id, vx, vy, vz)
+            refreshed_ids = cmd_bridge.hold_follower_positions_if_due(
+                list(command_intent.hover_ids),
+                positions=runtime_snapshot.positions,
+            )
+            subgroup_results = tuple(
+                SubgroupExecutionResult(
+                    radio_group=radio_group,
+                    executed_ids=tuple(
+                        did for did in drone_ids if did in refreshed_ids
+                    ),
+                    action="hold_follower_anchor_if_due",
+                )
+                for radio_group, drone_ids in runtime_snapshot.radio_groups.items()
+                if any(did in refreshed_ids for did in drone_ids)
+            )
+            return CommandExecutionResult(
+                action="live_single_follower",
+                subgroup_results=subgroup_results,
+            )
+
+        subgroup_results = self._apply_subgroup_follower_velocities(
+            cmd_bridge,
+            runtime_snapshot.radio_groups,
+            self._follower_indices,
+            u_safe,
+        )
+        return CommandExecutionResult(
+            action="group_follower_velocity",
+            subgroup_results=subgroup_results,
+        )
+
+    def _resolve_safety_execution_decision(
+        self,
+        safety_status: SafetyStatus,
+        tick_plan: CoordinatorTickPlan,
+    ) -> SafetyExecutionDecision:
+        if safety_status.need_emergency:
+            emergency_due_to_disconnect = any(
+                reason.startswith("断链") for reason in safety_status.reasons
+            )
+            if tick_plan.t_elapsed < 5.0 and not emergency_due_to_disconnect:
+                return SafetyExecutionDecision(
+                    action="hover",
+                    message=(
+                        f"[FormationRunner] 起飞稳定期 ({tick_plan.t_elapsed:.1f}s)，"
+                        f"降级为悬停: {safety_status.reasons}"
+                    ),
+                )
+            return SafetyExecutionDecision(
+                action="emergency_land",
+                message=f"[FormationRunner] 紧急状态! {safety_status.reasons}",
+            )
+
+        if safety_status.need_hover:
+            return SafetyExecutionDecision(
+                action="hover",
+                message=f"[FormationRunner] 悬停保护: {safety_status.reasons}",
+            )
+
+        return SafetyExecutionDecision(
+            action="execute_plan",
+            command_intent=tick_plan.command_intent,
+        )
+
     # ─────────────────────────────────────────
     # 控制循环
     # ─────────────────────────────────────────
@@ -328,6 +861,8 @@ class FormationRunner:
         self._cmd_bridge = CommandBridge(
             self._cfg, self._pose_bridge.get_cf_connections()
         )
+        if self._cmd_bridge is None:
+            raise RuntimeError("CommandBridge 初始化失败")
 
         # 等待定位数据就绪
         logger.info("[FormationRunner] 等待定位系统就绪（最多 30s）...")
@@ -337,35 +872,9 @@ class FormationRunner:
             return
 
         # 显示当前位置 & 预检查
-        state = self._pose_bridge.get_latest_state()
-        positions = state["positions"]
-        logger.info("[FormationRunner] 当前飞机位置:")
-        for did, d in state["per_drone"].items():
-            p = d["pos"]
-            logger.info(f"  drone {did}: ({p[0]:.3f}, {p[1]:.3f}, {p[2]:.3f})")
-
-        # 起飞前预检查：XY 边界和最小间距
-        b = self._cfg["safety"]["boundary"]
-        preflight_warnings = []
-        for i in range(self._n):
-            x, y, z = positions[i]
-            if x < b["x_min"] or x > b["x_max"] or y < b["y_min"] or y > b["y_max"]:
-                preflight_warnings.append(f"drone {i} XY 超出边界: ({x:.2f}, {y:.2f})")
-        dists = np.linalg.norm(
-            positions[:, np.newaxis, :] - positions[np.newaxis, :, :], axis=-1
+        self._stage_a_startup.preflight_inspector.run(
+            self._pose_bridge.get_latest_state()
         )
-        d_safe = self._cfg["safety"]["d_safe_m"]
-        for i in range(self._n):
-            for j in range(i + 1, self._n):
-                if dists[i, j] < d_safe:
-                    preflight_warnings.append(
-                        f"drone {i}-{j} 间距 {dists[i, j]:.3f}m < d_safe {d_safe}m"
-                    )
-        if preflight_warnings:
-            logger.warning("[FormationRunner] 起飞前预检查警告:")
-            for w in preflight_warnings:
-                logger.warning(f"  ⚠ {w}")
-            logger.warning("  请确认飞机位置是否正确再继续")
 
         # 等待用户确认起飞
         input("\n按 Enter 键全机起飞并启动编队控制... (Ctrl+C 取消)\n")
@@ -375,49 +884,16 @@ class FormationRunner:
         self._cmd_bridge.takeoff_all()
 
         # 验证起飞高度（轮询等待位置数据刷新）
-        min_takeoff_z = 0.15  # 至少离地 15cm 才算起飞成功
-        max_wait = 5.0  # 最多再等 5 秒
-        poll_interval = 0.5
-        elapsed = 0.0
-        while elapsed < max_wait:
-            time.sleep(poll_interval)
-            elapsed += poll_interval
-            state = self._pose_bridge.get_latest_state()
-            positions = state["positions"]
-            failed_drones = []
-            for i in range(self._n):
-                z = positions[i, 2]
-                if z < min_takeoff_z:
-                    failed_drones.append((i, z))
-            if not failed_drones:
-                logger.info(f"[FormationRunner] 全部起飞确认 ({elapsed:.1f}s)")
-                break
-            logger.info(
-                f"[FormationRunner] 等待起飞... ({elapsed:.1f}s) "
-                f"未达标: {[(d, f'{z:.3f}m') for d, z in failed_drones]}"
-            )
-        if failed_drones:
-            for did, z in failed_drones:
-                logger.error(f"[FormationRunner] drone {did} 起飞失败! z={z:.3f}m")
-            logger.error("[FormationRunner] 有飞机未成功起飞，执行降落")
-            self._cmd_bridge.land_all()
-            self._pose_bridge.stop()
+        if not self._stage_a_startup.takeoff_verifier.verify():
             return
 
-        # 锁定 Leader 位置（防止 takeoff 轨迹到期后漂移）
-        state = self._pose_bridge.get_latest_state()
-        self._cmd_bridge.lock_leader_positions(state["positions"])
-
-        # 构建 Leader 仿射演示轨迹（如果配置了 mission）
-        leader_pos = state["positions"][self._leader_indices]
-        self._build_leader_trajectory(leader_pos)
-
-        # 启动键盘监听
-        self._kbd_thread.start()
-
-        # 打开日志文件
-        if self._log_enabled:
-            self._open_log()
+        # 锁定 Leader / 构建轨迹 / 打开日志 / 启动键盘监听
+        if not self._stage_a_startup.control_loop_entrypoint.prepare():
+            return
+        self._cmd_bridge.lock_follower_positions(
+            self._pose_bridge.get_latest_state()["positions"],
+            self._follower_indices,
+        )
 
         # 进入控制循环
         self._running = True
@@ -431,45 +907,82 @@ class FormationRunner:
 
     def _control_loop(self):
         """固定频率控制循环。"""
+        cmd_bridge = self._cmd_bridge
+        if cmd_bridge is None:
+            raise RuntimeError("CommandBridge 未初始化")
+
         step = 0
         t_start = time.time()
 
         while self._running and not self._emergency:
             t_loop_start = time.time()
+            t_stage = t_loop_start
+            profile_ms: dict[str, float] = {}
 
             # 1. 读取当前状态
-            state = self._pose_bridge.get_latest_state()
-            positions = state["positions"]  # (n, 3)
+            runtime_snapshot = self._stage_a.state_aggregator.build_snapshot(
+                self._pose_bridge.get_latest_state()
+            )
+            profile_ms["state"] = (time.time() - t_stage) * 1000.0
+            t_stage = time.time()
+            tick_plan = self._stage_a.mission_coordinator.build_tick_plan(
+                runtime_snapshot,
+                t_elapsed=time.time() - t_start,
+            )
+            positions = tick_plan.positions  # (n, 3)
+            disconnected_ids = tick_plan.disconnected_ids
+            if disconnected_ids:
+                logger.error(
+                    "[FormationRunner] 检测到飞行中断链，立即紧急降落: "
+                    f"drones {disconnected_ids}"
+                )
+                self._emergency_land()
+                break
 
             # 1.5 更新 Leader 轨迹目标（如果有仿射演示轨迹）
-            t_elapsed = time.time() - t_start
-            if self._leader_traj is not None:
-                leader_targets = self._leader_traj(t_elapsed)  # (n_l, 3)
-                for i, lid in enumerate(self._leader_indices):
-                    self._cmd_bridge.update_leader_target(
-                        lid,
-                        float(leader_targets[i, 0]),
-                        float(leader_targets[i, 1]),
-                        float(leader_targets[i, 2]),
-                    )
+            self._stage_a.mission_coordinator.apply_leader_update(
+                cmd_bridge, tick_plan.leader_update
+            )
+            if tick_plan.leader_update.should_update:
+                self._last_leader_update_t = tick_plan.t_elapsed
+            profile_ms["leader"] = (time.time() - t_stage) * 1000.0
+            t_stage = time.time()
 
             # 2. 计算 AFC 速度命令（仅 follower）
             #    leaders 的位置来自真实定位，不需要主动控制
-            u_f = self._afc.all_follower_inputs(positions)  # (n_f, 3)
-
-            # 2.5 叠加排斥速度（轻量碰撞避免）
-            u_f = self._guard.repulsive_velocity(positions, u_f, self._follower_indices)
+            u_f = tick_plan.desired_follower_velocities
+            profile_ms["control"] = (time.time() - t_stage) * 1000.0
+            t_stage = time.time()
 
             # 3. 安全检查 + 限幅
             safety_status = self._guard.check(
                 positions=positions,
                 velocities_cmd=u_f,
                 follower_ids=self._follower_indices,
-                pose_state=state,
+                pose_state=tick_plan.runtime_snapshot.raw_state,
                 nominal_positions=self._nominal_pos,
             )
             u_safe = safety_status.clipped_velocities  # 始终有值
+            if u_safe is None:
+                raise RuntimeError("SafetyGuard 未返回 clipped_velocities")
             u_safe = self._apply_first_pass_limits(u_safe)
+            finalized_command_intent = (
+                self._stage_a.mission_coordinator.finalize_command_intent(
+                    tick_plan,
+                    u_safe,
+                )
+            )
+            tick_plan = CoordinatorTickPlan(
+                runtime_snapshot=tick_plan.runtime_snapshot,
+                positions=tick_plan.positions,
+                disconnected_ids=tick_plan.disconnected_ids,
+                t_elapsed=tick_plan.t_elapsed,
+                leader_update=tick_plan.leader_update,
+                desired_follower_velocities=tick_plan.desired_follower_velocities,
+                command_intent=finalized_command_intent,
+            )
+            profile_ms["safety"] = (time.time() - t_stage) * 1000.0
+            t_stage = time.time()
 
             # 4. 日志（在安全响应之前，确保 emergency 也能记录）
             if self._log_enabled and step % self._log_interval == 0:
@@ -479,64 +992,98 @@ class FormationRunner:
                 self._log_step(
                     step, time.time() - t_start, positions, u_safe, err, safety_status
                 )
+            profile_ms["logging"] = (time.time() - t_stage) * 1000.0
+            t_stage = time.time()
 
             # 5. 根据安全状态决定发送什么
-            t_elapsed = time.time() - t_start
-            if safety_status.need_emergency:
-                if t_elapsed < 5.0:
-                    # 起飞稳定期：降级为悬停，不触发紧急降落
-                    logger.warning(
-                        f"[FormationRunner] 起飞稳定期 ({t_elapsed:.1f}s)，"
-                        f"降级为悬停: {safety_status.reasons}"
-                    )
-                    self._cmd_bridge.hover_all()
+            safety_decision = self._stage_a.safety_arbiter.resolve(
+                safety_status,
+                tick_plan,
+            )
+            if safety_decision.message:
+                if safety_decision.action == "emergency_land":
+                    logger.error(safety_decision.message)
                 else:
-                    logger.error(f"[FormationRunner] 紧急状态! {safety_status.reasons}")
-                    self._emergency_land()
-                    break
-            elif safety_status.need_hover:
-                logger.warning(f"[FormationRunner] 悬停保护: {safety_status.reasons}")
-                self._cmd_bridge.hover_all()
+                    logger.warning(safety_decision.message)
+
+            command_execution_result = CommandExecutionResult(
+                action="noop",
+                subgroup_results=(),
+            )
+            if safety_decision.action == "emergency_land":
+                self._emergency_land()
+                break
+            if safety_decision.action == "hover":
+                cmd_bridge.hold_or_hover_followers_if_due(self._follower_indices)
+                command_execution_result = CommandExecutionResult(
+                    action="hover",
+                    subgroup_results=tuple(
+                        SubgroupExecutionResult(
+                            radio_group=radio_group,
+                            executed_ids=tuple(
+                                did
+                                for did in drone_ids
+                                if did in self._follower_indices
+                            ),
+                            action="hold_or_hover_followers_if_due",
+                        )
+                        for radio_group, drone_ids in tick_plan.runtime_snapshot.radio_groups.items()
+                        if any(did in self._follower_indices for did in drone_ids)
+                    ),
+                )
+            elif safety_decision.action == "execute_plan":
+                if safety_decision.command_intent is None:
+                    raise RuntimeError("Safety decision 缺少 command_intent")
+                command_execution_result = self._stage_a.radio_group_executor.execute(
+                    cmd_bridge,
+                    tick_plan.runtime_snapshot,
+                    u_safe,
+                    safety_decision.command_intent,
+                    step,
+                )
             else:
-                if self._algorithm_mode == "dry_run":
-                    if step % self._log_interval == 0:
-                        logger.info(
-                            f"[FormationRunner] DRY-RUN step={step} "
-                            f"followers={self._follower_indices} "
-                            f"u_safe={np.array2string(u_safe, precision=3, suppress_small=True)}"
-                        )
-                    self._cmd_bridge.hover_all()
-                elif self._algorithm_mode == "live_single_follower":
-                    live_target = self._cfg["algorithm_integration"][
-                        "single_live_follower"
-                    ]
-                    live_ids = [
-                        d["id"]
-                        for d in self._cfg["drones"]
-                        if d.get("name") == live_target
-                    ]
-                    if not live_ids:
-                        raise RuntimeError(
-                            f"single_live_follower={live_target!r} not found in config"
-                        )
-                    did = live_ids[0]
-                    idx = self._follower_indices.index(did)
-                    vx, vy, vz = [float(x) for x in u_safe[idx]]
-                    self._cmd_bridge.send_drone_velocity(did, vx, vy, vz)
-                    self._cmd_bridge.hover_all()
-                else:
-                    # 正常下发速度
-                    self._cmd_bridge.send_follower_velocities(
-                        self._follower_indices, u_safe
-                    )
+                raise RuntimeError(
+                    f"Unknown safety execution action: {safety_decision.action}"
+                )
+            profile_ms["subgroups"] = float(
+                len(command_execution_result.subgroup_results)
+            )
+            command_trace = ";".join(
+                f"{result.action}:{list(result.executed_ids)}"
+                for result in command_execution_result.subgroup_results
+            )
+            if not command_trace:
+                command_trace = "none"
+            profile_ms["command"] = (time.time() - t_stage) * 1000.0
+            t_stage = time.time()
 
             # Leader 持续发送 keepalive（防止 watchdog 超时）
-            self._cmd_bridge.keepalive_hover(watchdog_interval_s=0.3)
+            cmd_bridge.keepalive_hover(watchdog_interval_s=0.3)
+            profile_ms["keepalive"] = (time.time() - t_stage) * 1000.0
 
             step += 1
 
             # 6. 等待下一控制步
             elapsed = time.time() - t_loop_start
+            total_ms = elapsed * 1000.0
+            if self._profiling_enabled and (
+                step % self._profiling_interval == 0
+                or total_ms >= self._profiling_warn_threshold_ms
+            ):
+                logger.warning(
+                    "[FormationRunner] loop profile "
+                    f"step={step} total={total_ms:.1f}ms "
+                    f"state={profile_ms.get('state', 0.0):.1f} "
+                    f"leader={profile_ms.get('leader', 0.0):.1f} "
+                    f"control={profile_ms.get('control', 0.0):.1f} "
+                    f"safety={profile_ms.get('safety', 0.0):.1f} "
+                    f"logging={profile_ms.get('logging', 0.0):.1f} "
+                    f"subgroups={profile_ms.get('subgroups', 0.0):.0f} "
+                    f"command={profile_ms.get('command', 0.0):.1f} "
+                    f"keepalive={profile_ms.get('keepalive', 0.0):.1f} "
+                    f"actions={command_execution_result.action} "
+                    f"targets={command_trace}"
+                )
             sleep_t = self._dt - elapsed
             if sleep_t > 0:
                 time.sleep(sleep_t)
@@ -575,7 +1122,17 @@ class FormationRunner:
         self._running = False
         self._emergency = True  # 防止 _shutdown() 再次触发降落
         if self._cmd_bridge:
-            self._cmd_bridge.land_all(duration_s=2.0)
+            state = self._pose_bridge.get_latest_state()
+            stale_ids = [
+                did
+                for did, info in state.get("per_drone", {}).items()
+                if not info["fresh"]
+            ]
+            disconnected_ids = list(state.get("disconnected_ids", []))
+            priority_ids = stale_ids + [
+                did for did in disconnected_ids if did not in stale_ids
+            ]
+            self._cmd_bridge.land_all(duration_s=2.0, priority_ids=priority_ids)
 
     def _shutdown(self):
         """正常或紧急退出时的清理流程。"""
@@ -653,7 +1210,12 @@ class FormationRunner:
             row[f"d{i}_vz_cmd"] = f"{u_safe[k, 2]:.4f}"
         row["safety_level"] = status.level
         self._csv_writer.writerow(row)
-        self._log_file.flush()
+        if (
+            self._log_file is not None
+            and (step - self._last_log_flush_step) >= self._log_flush_interval
+        ):
+            self._log_file.flush()
+            self._last_log_flush_step = step
 
 
 # ─────────────────────────────────────────────────────────

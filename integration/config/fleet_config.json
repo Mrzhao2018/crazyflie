@@ -2,8 +2,8 @@
   "_comment": "Crazyflie 真机编队配置文件 — 按照实际飞机和场地修改",
   "formation": {
     "n_agents": 6,
-    "leader_indices": [ 1, 3, 4, 5 ],
-    "_comment_leaders": "固定 2×3 六机真值顺序：0=cf110_701, 1=cf110_702, 2=cf110_703, 3=cf60_701, 4=cf60_702, 5=cf60_703。当前 3D 仿射 Leader 固定为 cf110_702 + cf60_701/702/703。",
+    "leader_indices": [ 1, 2, 4, 5 ],
+    "_comment_leaders": "固定 2×3 六机真值顺序：0=cf110_701, 1=cf110_702, 2=cf110_703, 3=cf60_701, 4=cf60_702, 5=cf60_703。通信诊断配置：保持 4 leader + 2 follower，但将 follower 分散到 110/60 两侧，当前 Leader 为 cf110_702 + cf110_703 + cf60_702 + cf60_703。",
     "dim": 3
   },
   "drones": [
@@ -14,11 +14,11 @@
       "uri": "radio://0/110/2M/E7E7E7E701",
       "channel": 110,
       "takeoff_height_m": 0.4,
-      "_comment": "Follower 飞机（110 组左侧）"
+      "_comment": "Follower 飞机（110 组，通信诊断保留一个 follower）"
     },
     { "id": 1, "role": "leader", "name": "cf110_702", "uri": "radio://0/110/2M/E7E7E7E702", "channel": 110, "takeoff_height_m": 0.4 },
-    { "id": 2, "role": "follower", "name": "cf110_703", "uri": "radio://0/110/2M/E7E7E7E703", "channel": 110, "takeoff_height_m": 0.4 },
-    { "id": 3, "role": "leader", "name": "cf60_701", "uri": "radio://1/60/2M/E7E7E7E701", "channel": 60, "takeoff_height_m": 0.4 },
+    { "id": 2, "role": "leader", "name": "cf110_703", "uri": "radio://0/110/2M/E7E7E7E703", "channel": 110, "takeoff_height_m": 0.4 },
+    { "id": 3, "role": "follower", "name": "cf60_701", "uri": "radio://1/60/2M/E7E7E7E701", "channel": 60, "takeoff_height_m": 0.4 },
     { "id": 4, "role": "leader", "name": "cf60_702", "uri": "radio://1/60/2M/E7E7E7E702", "channel": 60, "takeoff_height_m": 0.4 },
     { "id": 5, "role": "leader", "name": "cf60_703", "uri": "radio://1/60/2M/E7E7E7E703", "channel": 60, "takeoff_height_m": 0.4 }
   ],
@@ -34,7 +34,7 @@
     "_comment_cmd": "velocity: send_velocity_world_setpoint；position: send_position_setpoint"
   },
   "algorithm_integration": {
-    "mode": "dry_run",
+    "mode": "live_single_follower",
     "allowed_modes": ["dry_run", "live_single_follower", "live_group"],
     "first_live_group": ["cf60_701", "cf60_702", "cf60_703"],
     "single_live_follower": "cf110_701",
@@ -44,7 +44,36 @@
     "max_xy_velocity_mps": 0.10,
     "max_z_velocity_mps": 0.00,
     "max_live_duration_s": 20.0,
+    "dry_run_print_interval_steps": 50,
+    "leader_update_interval_s": 1.0,
     "_comment": "算法融合第一阶段：默认 dry_run；先在 cf60 组三机上验证，live 时只允许保守平面速度修正"
+  },
+  "stage_b": {
+    "enabled": true,
+    "single_follower_intent_refresh_s": 0.5,
+    "single_follower_target_change_threshold_m": 0.05,
+    "single_follower_target_change_threshold_rad": 0.0,
+    "single_follower_use_velocity_fallback": true,
+    "single_follower_max_refresh_jitter_s": 0.1,
+    "_comment": "Stage B Phase B1: 仅 live_single_follower 启用 retained intent + local pacing；active follower 仅在目标/速度变化显著或 refresh timer 到期时才刷新 transport primitive。"
+  },
+  "communication": {
+    "pose_log_period_ms": 100,
+    "startup_subscribe_spacing_s": 0.05,
+    "startup_enhighlevel_rounds": 1,
+    "startup_enhighlevel_retry_interval_s": 0.10,
+    "startup_enhighlevel_post_delay_s": 0.10,
+    "takeoff_retries": 2,
+    "takeoff_retry_interval_s": 0.45,
+    "takeoff_inter_drone_delay_s": 0.03,
+    "hover_command_interval_s": 0.30,
+    "follower_anchor_refresh_error_m": 0.08,
+    "leader_round_robin": true,
+    "leader_command_spacing_s": 0.03,
+    "land_retries": 3,
+    "land_retry_interval_s": 0.40,
+    "land_inter_drone_delay_s": 0.05,
+    "_comment": "通信优化当前配置：Follower anchor refresh 已改为阈值式稀疏刷新，因此可将姿态日志恢复到 10Hz，优先验证剩余 stale 是否属于 telemetry 更新密度不足。若要真正把 follower 分散到不同 radio，还需要同步修改机体端 radio 配置，不在本次软件改动里直接改 URI。"
   },
   "safety": {
     "d_safe_m": 0.3,
@@ -54,8 +83,8 @@
     "max_velocity_mps": 0.4,
     "max_position_error_m": 2.0,
     "_comment_poserr": "飞机位置与标称位置差超过此值时触发悬停保护",
-    "pose_timeout_s": 0.5,
-    "_comment_timeout": "定位数据超过此时长未更新时触发悬停",
+    "pose_timeout_s": 0.8,
+    "_comment_timeout": "定位数据超过此时长未更新时触发悬停；当前 5Hz position-only 日志下先放宽到 0.8s，避免单机短暂丢两三帧即 stale",
     "boundary": {
       "x_min": -1.75,
       "x_max": 1.75,
@@ -92,7 +121,14 @@
   "logging": {
     "enabled": true,
     "log_dir": "integration/logs",
-    "log_interval_steps": 1,
-    "_comment": "每控制步记录一次；设为 5 则每 5 步记录一次"
+    "log_interval_steps": 5,
+    "flush_interval_steps": 20,
+    "_comment": "通信优化后默认每 5 个控制步记录一次，并降低 flush 频率，减少 host 侧阻塞"
+  },
+  "profiling": {
+    "enabled": true,
+    "interval_steps": 20,
+    "warn_threshold_ms": 150.0,
+    "_comment": "控制循环分段耗时剖析，低频输出各阶段时间，帮助定位 host-side 卡顿来源。"
   }
 }
