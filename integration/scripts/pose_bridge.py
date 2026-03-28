@@ -28,6 +28,7 @@ state 字典格式：
 import threading
 import time
 import logging
+from typing import Any
 import numpy as np
 
 logger = logging.getLogger(__name__)
@@ -46,6 +47,12 @@ try:
     _CFLIB_OK = True
 except ImportError:
     _CFLIB_OK = False
+    cflib = None
+    Crazyflie = None
+    LogConfig = None
+    SyncCrazyflie = None
+    CRTPPacket = None
+    CRTPPort = None
     logger.warning("cflib 未安装，PoseBridge 将在 MOCK 模式下运行（仅供调试）。")
 
 
@@ -91,6 +98,11 @@ class PoseBridge:
         self._n = config["formation"]["n_agents"]
         self._timeout_s = config["safety"]["pose_timeout_s"]
         self._drones_cfg = config["drones"]
+        comm_cfg = config.get("communication", {})
+        self._pose_log_period_ms = int(comm_cfg.get("pose_log_period_ms", 100))
+        self._startup_subscribe_spacing_s = float(
+            comm_cfg.get("startup_subscribe_spacing_s", 0.0)
+        )
 
         # 坐标变换参数
         ct = config["coordinate_transform"]
@@ -108,9 +120,13 @@ class PoseBridge:
         }
 
         # cflib 连接句柄（id -> SyncCrazyflie）
-        self._scs: dict[int, object] = {}
+        self._scs: dict[int, Any] = {}
         # 每架飞机的 LogConfig 句柄（必须持有引用，避免日志订阅生命周期异常）
-        self._log_configs: dict[int, object] = {}
+        self._log_configs: dict[int, Any] = {}
+        # 每架飞机 fully_connected / 首包日志事件
+        self._fully_connected_events: dict[int, threading.Event] = {}
+        self._first_log_events: dict[int, threading.Event] = {}
+        self._link_ok: dict[int, bool] = {d["id"]: False for d in self._drones_cfg}
         self._running = False
 
     # ─────────────────────────────────────────
@@ -124,8 +140,14 @@ class PoseBridge:
             self._running = True
             return
 
+        assert cflib is not None
+        assert Crazyflie is not None
+        assert SyncCrazyflie is not None
+
         cflib.crtp.init_drivers()
+        did = -1
         try:
+            # Phase 1: 打开所有链路并注册 fully_connected 事件
             for drone in self._drones_cfg:
                 did = drone["id"]
                 uri = drone["uri"]
@@ -133,28 +155,57 @@ class PoseBridge:
                 sc = SyncCrazyflie(uri, cf=Crazyflie(rw_cache="./cache"))
 
                 fully_connected = threading.Event()
+                self._fully_connected_events[did] = fully_connected
 
                 def _on_fully_connected(link_uri, _did=did):
                     logger.info(
                         f"[PoseBridge] drone {_did} fully connected: {link_uri}"
                     )
+                    self._link_ok[_did] = True
                     fully_connected.set()
 
+                def _on_connection_lost(link_uri, msg, _did=did):
+                    self._link_ok[_did] = False
+                    logger.error(
+                        f"[PoseBridge] drone {_did} 连接丢失: {link_uri} ({msg})"
+                    )
+
+                def _on_disconnected(link_uri, _did=did):
+                    self._link_ok[_did] = False
+                    logger.info(f"[PoseBridge] drone {_did} 已断开: {link_uri}")
+
                 sc.cf.fully_connected.add_callback(_on_fully_connected)
+                sc.cf.connection_lost.add_callback(_on_connection_lost)
+                sc.cf.disconnected.add_callback(_on_disconnected)
                 sc.open_link()
                 self._scs[did] = sc
 
+            # Phase 2: 等待所有飞机 fully_connected，再做参数写入
+            for drone in self._drones_cfg:
+                did = drone["id"]
+                fully_connected = self._fully_connected_events[did]
                 if not fully_connected.wait(timeout=15.0):
                     raise TimeoutError(f"drone {did} 等待 fully connected 超时")
+
+                sc = self._scs[did]
 
                 # 非阻塞写 commander.enHighLevel = 1
                 # set_value() 会阻塞等全部参数读完（4架时要等1分钟+），
                 # 改用直接发 CRTP 包，fire-and-forget
                 self._set_param_nonblocking(sc, "commander.enHighLevel", 1)
-                time.sleep(0.1)  # 给 radio 时间发包
+                time.sleep(0.05)  # 给 radio 时间发包
 
+            # Phase 3: 所有飞机统一启动日志订阅，避免前面飞机过早开始 freshness 计时
+            for drone in self._drones_cfg:
+                did = drone["id"]
+                sc = self._scs[did]
                 self._subscribe_log(sc, did)
                 logger.info(f"[PoseBridge] drone {did} 连接成功")
+                if self._startup_subscribe_spacing_s > 0.0:
+                    time.sleep(self._startup_subscribe_spacing_s)
+
+            # Phase 4: 显式等待每架飞机至少收到一帧 stateEstimate
+            self._wait_for_first_logs(timeout_s=10.0)
         except Exception as e:
             logger.error(f"[PoseBridge] drone {did} 连接失败: {e}，清理已建立连接...")
             self.stop()  # 清理已成功建立的连接，防止泄漏
@@ -172,10 +223,13 @@ class PoseBridge:
             except Exception as e:
                 logger.warning(f"[PoseBridge] 停止 drone {did} 日志订阅时出错: {e}")
         self._log_configs.clear()
+        self._fully_connected_events.clear()
+        self._first_log_events.clear()
 
         for did, sc in self._scs.items():
             try:
                 sc.close_link()
+                self._link_ok[did] = False
                 logger.info(f"[PoseBridge] drone {did} 连接已关闭")
             except Exception as e:
                 logger.warning(f"[PoseBridge] 关闭 drone {did} 时出错: {e}")
@@ -209,6 +263,7 @@ class PoseBridge:
             "velocities": velocities,
             "timestamp": time.time(),
             "per_drone": per_drone,
+            "disconnected_ids": self.get_disconnected_ids(),
         }
 
     def is_all_fresh(self) -> bool:
@@ -227,6 +282,10 @@ class PoseBridge:
         供 CommandBridge 共享使用，避免对同一架飞机建立双重无线连接。
         """
         return self._scs
+
+    def get_disconnected_ids(self) -> list[int]:
+        """返回当前已知断链的飞机 id 列表。"""
+        return [did for did, ok in self._link_ok.items() if not ok]
 
     def wait_until_fresh(self, timeout_s: float = 10.0) -> bool:
         """
@@ -256,6 +315,9 @@ class PoseBridge:
         """
         import struct
 
+        assert CRTPPacket is not None
+        assert CRTPPort is not None
+
         PARAM_WRITE_CH = 2
         try:
             element = sc.cf.param.toc.get_element_by_complete_name(param_name)
@@ -279,9 +341,12 @@ class PoseBridge:
 
     def _subscribe_log(self, sc, drone_id: int):
         """为一架飞机注册 stateEstimate 日志回调。"""
+        assert LogConfig is not None
+        first_log_event = threading.Event()
+        self._first_log_events[drone_id] = first_log_event
         lgc = LogConfig(
-            name=f"StateEst_{drone_id}", period_in_ms=100
-        )  # 10 Hz, dry-run 第一阶段减载
+            name=f"StateEst_{drone_id}", period_in_ms=self._pose_log_period_ms
+        )
         lgc.add_variable("stateEstimate.x", "float")
         lgc.add_variable("stateEstimate.y", "float")
         lgc.add_variable("stateEstimate.z", "float")
@@ -296,6 +361,7 @@ class PoseBridge:
                     vy=0.0,
                     vz=0.0,
                 )
+                first_log_event.set()
             except KeyError as e:
                 logger.warning(f"[PoseBridge] drone {did} 数据键缺失: {e}")
 
@@ -308,4 +374,20 @@ class PoseBridge:
         )
         self._log_configs[drone_id] = lgc
         lgc.start()
-        logger.info(f"[PoseBridge] drone {drone_id} 日志订阅成功 (10Hz, position-only)")
+        logger.info(
+            f"[PoseBridge] drone {drone_id} 日志订阅成功 "
+            f"({1000.0 / self._pose_log_period_ms:.1f}Hz, position-only)"
+        )
+
+    def _wait_for_first_logs(self, timeout_s: float = 10.0):
+        """等待每架飞机至少收到一帧 stateEstimate。"""
+        for drone in self._drones_cfg:
+            did = drone["id"]
+            first_log_event = self._first_log_events.get(did)
+            if first_log_event is None:
+                raise RuntimeError(f"drone {did} 缺少首包日志事件")
+            if not first_log_event.wait(timeout=timeout_s):
+                raise TimeoutError(
+                    f"drone {did} 在 {timeout_s:.1f}s 内未收到 stateEstimate 首包"
+                )
+            logger.info(f"[PoseBridge] drone {did} 已收到首帧 stateEstimate")
